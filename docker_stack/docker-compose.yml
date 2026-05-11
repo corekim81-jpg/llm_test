@@ -1,0 +1,122 @@
+# ================================================================
+# BankSystem_16 관측성 스택
+# ================================================================
+# 실행:   docker compose up -d
+# 중지:   docker compose down
+# 로그:   docker compose logs -f
+#
+# 포트 요약:
+#   Prometheus  http://localhost:9090
+#   Loki        http://localhost:3100
+#   Grafana     http://localhost:3000  (admin / admin)
+#   Jaeger      http://localhost:16686
+# ================================================================
+
+services:
+
+  # ──────────────────────────────────────────────────────────────
+  # Prometheus — 메트릭 저장소
+  # ──────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: bank16-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"          # POST /-/reload 허용
+      - "--web.enable-remote-write-receiver"  # OTel 수신
+    networks:
+      - bank16
+
+  # ──────────────────────────────────────────────────────────────
+  # Loki — 로그 저장소
+  # ──────────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:2.9.5
+    container_name: bank16-loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/loki.yml
+    networks:
+      - bank16
+
+  # ──────────────────────────────────────────────────────────────
+  # Promtail — 로그 수집 에이전트 (Linux 서버용)
+  # BankSystem_16 web01/web02 서버에 배포할 설정 포함
+  # ──────────────────────────────────────────────────────────────
+  promtail:
+    image: grafana/promtail:2.9.5
+    container_name: bank16-promtail
+    restart: unless-stopped
+    volumes:
+      - ./loki/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/log:/var/log:ro          # 호스트 로그 마운트
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    command: -config.file=/etc/promtail/promtail.yml
+    networks:
+      - bank16
+    depends_on:
+      - loki
+
+  # ──────────────────────────────────────────────────────────────
+  # Jaeger — 분산 트레이싱
+  # ──────────────────────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.56
+    container_name: bank16-jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+      - "14268:14268"   # Jaeger HTTP collector
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - SPAN_STORAGE_TYPE=memory
+      - MEMORY_MAX_TRACES=50000
+    networks:
+      - bank16
+
+  # ──────────────────────────────────────────────────────────────
+  # Grafana — 시각화
+  # ──────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.3.3
+    container_name: bank16-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_FEATURE_TOGGLES_ENABLE=lokiLive
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      - bank16
+    depends_on:
+      - prometheus
+      - loki
+
+# ── 네트워크 & 볼륨 ──────────────────────────────────────────────
+networks:
+  bank16:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  loki_data:
+  grafana_data:

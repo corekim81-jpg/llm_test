@@ -1,0 +1,79 @@
+# ================================================================
+# Grafana Alloy 설정 — WAS/DB 서버 (Windows)
+# ================================================================
+# Windows 서버(was01/02, db01/02)는 Promtail 대신
+# Grafana Alloy (구 Grafana Agent) 사용을 권장.
+#
+# 설치:
+#   1. https://github.com/grafana/alloy/releases 에서 Windows 설치파일 다운로드
+#   2. 이 설정 파일을 C:\Program Files\GrafanaLabs\Alloy\config.alloy 로 저장
+#   3. 서비스 재시작
+#
+# 설정 파일 형식: River (HCL 계열)
+# ================================================================
+
+// ── Loki 전송 설정 ────────────────────────────────────────────
+loki.write "default" {
+  endpoint {
+    url = "http://192.168.x.x:3100/loki/api/v1/push"  // ← Loki 서버 IP
+  }
+}
+
+// ── Tomcat 로그 수집 (was01-bank16) ──────────────────────────
+local.file_match "tomcat_logs" {
+  path_targets = [
+    {
+      __path__ = "C:\\Program Files\\Apache Software Foundation\\Tomcat 9.0\\logs\\catalina.*.log",
+      host     = "was01-bank16",   // ← 서버별로 변경
+      job      = "tomcat",
+    },
+    {
+      __path__ = "C:\\Program Files\\Apache Software Foundation\\Tomcat 9.0\\logs\\localhost_access_log.*.txt",
+      host     = "was01-bank16",
+      job      = "tomcat_access",
+    },
+  ]
+}
+
+loki.source.file "tomcat" {
+  targets    = local.file_match.tomcat_logs.targets
+  forward_to = [loki.write.default.receiver]
+}
+
+// ── 애플리케이션 로그 (Spring Boot) ──────────────────────────
+local.file_match "app_logs" {
+  path_targets = [
+    {
+      __path__ = "C:\\app\\BankSystem16\\logs\\*.log",
+      host     = "was01-bank16",
+      job      = "spring_boot",
+    },
+  ]
+}
+
+loki.source.file "app" {
+  targets    = local.file_match.app_logs.targets
+  forward_to = [loki.write.default.receiver]
+}
+
+// ── MySQL 로그 수집 (db01-bank16) ────────────────────────────
+// DB 서버에서는 아래 설정 사용
+local.file_match "mysql_logs" {
+  path_targets = [
+    {
+      __path__ = "C:\\ProgramData\\MySQL\\MySQL Server 8.0\\Data\\*-error.log",
+      host     = "db01-bank16",   // ← 서버별로 변경
+      job      = "mysql_error",
+    },
+    {
+      __path__ = "C:\\ProgramData\\MySQL\\MySQL Server 8.0\\Data\\*-slow.log",
+      host     = "db01-bank16",
+      job      = "mysql_slow",
+    },
+  ]
+}
+
+loki.source.file "mysql" {
+  targets    = local.file_match.mysql_logs.targets
+  forward_to = [loki.write.default.receiver]
+}

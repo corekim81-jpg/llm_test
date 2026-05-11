@@ -1,0 +1,68 @@
+# ================================================================
+# Promtail 설정 — BankSystem_16 Web 서버 (Apache / Linux)
+# ================================================================
+# 배포 위치: web01-bank16, web02-bank16 (192.168.16.10/11)
+#
+# 이 파일을 각 서버에 복사 후 실행:
+#   promtail -config.file=promtail.yml
+#
+# 또는 systemd 서비스 등록:
+#   /etc/systemd/system/promtail.service
+# ================================================================
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://192.168.x.x:3100/loki/api/v1/push  # ← Loki 서버 IP로 교체
+    tenant_id: banksystem16
+
+scrape_configs:
+
+  # ── Apache 액세스 로그 ──────────────────────────────────────
+  - job_name: "apache_access"
+    static_configs:
+      - targets: ["localhost"]
+        labels:
+          job:  "apache"
+          host: "web01-bank16"    # ← 서버별로 변경
+          env:  "production"
+          __path__: "/var/log/httpd/access_log"
+    pipeline_stages:
+      - regex:
+          # Apache Combined Log Format 파싱
+          expression: '^(?P<remote_addr>\S+) \S+ \S+ \[(?P<time>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+) \S+" (?P<status>\d+) (?P<bytes>\d+|-)'
+      - labels:
+          status:
+          method:
+      - timestamp:
+          source: time
+          format: "02/Jan/2006:15:04:05 -0700"
+
+  # ── Apache 에러 로그 ────────────────────────────────────────
+  - job_name: "apache_error"
+    static_configs:
+      - targets: ["localhost"]
+        labels:
+          job:  "apache_error"
+          host: "web01-bank16"    # ← 서버별로 변경
+          env:  "production"
+          __path__: "/var/log/httpd/error_log"
+    pipeline_stages:
+      - regex:
+          expression: '^\[(?P<time>[^\]]+)\] \[(?P<level>[^\]]+)\]'
+      - labels:
+          level:
+
+  # ── 시스템 로그 (syslog) ────────────────────────────────────
+  - job_name: "syslog"
+    static_configs:
+      - targets: ["localhost"]
+        labels:
+          job:  "syslog"
+          host: "web01-bank16"
+          __path__: "/var/log/messages"

@@ -1,0 +1,98 @@
+# ================================================================
+# Prometheus 스크레이프 설정 — BankSystem_16
+# ================================================================
+# exporter 포트:
+#   web  (Linux)   node_exporter    :9100
+#                  apache_exporter  :9117
+#   was  (Windows) jmx_exporter     :9090  ← WAS IP로 접근
+#   db   (Windows) mysqld_exporter  :9104
+# ================================================================
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    system: "banksystem16"
+
+# 알람 규칙 (선택)
+rule_files:
+  - "rules/*.yml"
+
+scrape_configs:
+
+  # ── Prometheus 자체 모니터링 ──────────────────────────────────
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # ── Web Layer (Apache / Linux) ─────────────────────────────────
+  - job_name: "apache_exporter"
+    static_configs:
+      - targets:
+          - "192.168.16.10:9117"   # web01-bank16
+          - "192.168.16.11:9117"   # web02-bank16
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "(192\\.168\\.16\\.10).*"
+        target_label: hostname
+        replacement: "web01-bank16"
+      - source_labels: [__address__]
+        regex: "(192\\.168\\.16\\.11).*"
+        target_label: hostname
+        replacement: "web02-bank16"
+
+  - job_name: "node_exporter"
+    static_configs:
+      - targets:
+          - "192.168.16.10:9100"   # web01-bank16
+          - "192.168.16.11:9100"   # web02-bank16
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "(192\\.168\\.16\\.10).*"
+        target_label: hostname
+        replacement: "web01-bank16"
+      - source_labels: [__address__]
+        regex: "(192\\.168\\.16\\.11).*"
+        target_label: hostname
+        replacement: "web02-bank16"
+
+  # ── WAS Layer (Tomcat / Windows) ─────────────────────────────
+  - job_name: "jmx_exporter"
+    static_configs:
+      - targets:
+          - "192.168.16.20:9090"   # was01-bank16
+          - "192.168.16.21:9090"   # was02-bank16
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "(192\\.168\\.16\\.20).*"
+        target_label: hostname
+        replacement: "was01-bank16"
+      - source_labels: [__address__]
+        regex: "(192\\.168\\.16\\.21).*"
+        target_label: hostname
+        replacement: "was02-bank16"
+
+  # ── DB Layer (MySQL / Windows) ───────────────────────────────
+  - job_name: "mysqld_exporter"
+    static_configs:
+      - targets:
+          - "192.168.16.30:9104"   # db01-bank16
+          - "192.168.16.31:9104"   # db02-bank16
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "(192\\.168\\.16\\.30).*"
+        target_label: hostname
+        replacement: "db01-bank16"
+      - source_labels: [__address__]
+        regex: "(192\\.168\\.16\\.31).*"
+        target_label: hostname
+        replacement: "db02-bank16"
+
+  # ── windows_exporter (WAS/DB 서버 OS 메트릭) ─────────────────
+  - job_name: "windows_exporter"
+    static_configs:
+      - targets:
+          - "192.168.16.20:9182"   # was01-bank16
+          - "192.168.16.21:9182"   # was02-bank16
+          - "192.168.16.30:9182"   # db01-bank16
+          - "192.168.16.31:9182"   # db02-bank16
