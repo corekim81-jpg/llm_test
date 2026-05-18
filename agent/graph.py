@@ -7,6 +7,10 @@ agent/graph.py — LangGraph 그래프 조립
 
 from __future__ import annotations
 import os, logging
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
 from typing import Optional
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage

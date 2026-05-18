@@ -20,6 +20,11 @@ import hashlib
 from datetime import datetime
 from typing import Type, Optional
 from pydantic import BaseModel, Field
+import asyncio
+
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 try:
     from langchain_core.tools import BaseTool
@@ -50,18 +55,20 @@ class LogQLBuilder:
         label_filters: dict = None,  # 추가 stream 셀렉터
     ) -> str:
         # Stream selector
-        selectors = {'"host"': f'"{self.host}"'}
+        # selectors = {'"host"': f'"{self.host}"'} # # 결과: {"host"="web01"}  ← 잘못된 LogQL
+        selectors = {"host": f'"{self.host}"'}
         if self.job:
             selectors['"job"'] = f'"{self.job}"'
         if label_filters:
             for k, v in label_filters.items():
                 selectors[f'"{k}"'] = f'"{v}"'
         stream = "{" + ",".join(f"{k}={v}" for k, v in selectors.items()) + "}"
+        
 
         # Pipeline filters
         pipeline = ""
-        if level_filter:
-            pipeline += f' |~ `(?i)({level_filter})`'
+        if level_filter:            
+            pipeline += f' |~ `(?i)({level_filter})`' # (?i) 대소문자 무시 플래그
         if status_code:
             pipeline += f' |~ `(?:status|HTTP).*{re.escape(status_code)}|{re.escape(status_code)}.*(?:status|HTTP)`'
         if keyword:
@@ -72,13 +79,13 @@ class LogQLBuilder:
         return stream + pipeline
 
     def build_error_logql(self) -> str:
-        return self.build(level_filter="ERROR|FATAL|error|fatal")
+        return self.build(level_filter="ERROR|FATAL")
 
     def build_http500_logql(self) -> str:
-        return self.build(status_code="500", level_filter="error|ERROR")
+        return self.build(status_code="500", level_filter="ERROR")
 
     def build_oom_logql(self) -> str:
-        return self.build(keyword="OutOfMemoryError|OOM|GC overhead|java.lang.OutOfMemory")
+        return self.build(keyword="OutOfMemoryError|OOM|GC overhead|java.lang.OutOfMemory")        
 
 
 # ── 로그 전처리 ───────────────────────────────────────────────────
@@ -116,24 +123,35 @@ def preprocess_logs(raw_logs: list[dict]) -> dict:
             trace_id_set.add(tid.group(1))
 
         # 스택트레이스 감지
+        # 스택트레이스 라인이면 누적만 하고 나머지 처리 스킵
         if STACK_LINE_RE.match(line):
             current_trace.append(line.strip())
-        else:
-            if len(current_trace) >= 2:
-                stack_traces.append(current_trace[:8])  # 최대 8줄
-            current_trace = []
+            continue                              # ← level_counts 집계에서도 제외
+        
+        
+        # 일반 라인 진입 시 직전 스택트레이스 flush
+        if len(current_trace) >= 2:
+            stack_traces.append(current_trace[:8]) # 최대 8줄
+        current_trace = []
 
-            # 중복 제거 (내용 해시)
-            content_hash = hashlib.md5(
-                re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}', '', line).encode()
-            ).hexdigest()[:12]
-            if content_hash in seen_hashes:
-                continue
-            seen_hashes.add(content_hash)
+        # 레벨 집계 (스택트레이스 라인 제외됨)
+        level_counts[level] = level_counts.get(level, 0) + 1
 
-            # 핵심 에러 로그 (ERROR/FATAL/WARN)
-            if level in ("ERROR", "FATAL", "WARN"):
-                key_logs.append({"time": t, "level": level, "log": line[:250]})
+        # 중복 제거
+        content_hash = hashlib.md5(
+            re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}', '', line).encode()
+        ).hexdigest()[:12]
+        if content_hash in seen_hashes:
+            continue
+        seen_hashes.add(content_hash)
+
+        # 핵심 에러 로그
+        if level in ("ERROR", "FATAL", "WARN"):
+            key_logs.append({"time": t, "level": level, "log": line[:250]})
+
+    # ↓ 루프 종료 후 마지막 스택트레이스 flush
+    if len(current_trace) >= 2:
+        stack_traces.append(current_trace[:8]) # 최대 8줄                      
 
     return {
         "total": len(raw_logs),
@@ -182,8 +200,9 @@ class LokiInput(BaseModel):
     start_ts: int    = Field(description="시작 Unix timestamp")
     end_ts: int      = Field(description="종료 Unix timestamp")
     level_filter: str = Field(
-        default="ERROR|WARN|error|warn",
-        description="로그 레벨 필터 (정규식, 예: 'ERROR|FATAL')"
+        # default="ERROR|WARN|error|warn", # 정규식에서 대소문자 구분 제거 하면 됨 
+        default="ERROR|WARN",
+        description="로그 레벨 필터 — 대소문자 자동 무시 (예: 'ERROR|WARN|FATAL')"
     )
     keyword: str      = Field(default="", description="추가 키워드 필터 (예: '500|OOM|timeout')")
     status_code: str  = Field(default="", description="HTTP 상태코드 필터 (예: '500')")
@@ -207,7 +226,7 @@ class LokiQueryTool(BaseTool):
         loki_host: str,
         start_ts: int,
         end_ts: int,
-        level_filter: str = "ERROR|WARN|error|warn",
+        level_filter: str = "ERROR|WARN",
         keyword: str = "",
         status_code: str = "",
         trace_id: str = "",
@@ -255,9 +274,12 @@ class LokiQueryTool(BaseTool):
 
         # raw 로그 파싱
         raw_logs = []
-        for stream in data["data"]["result"]:
+        result_data = data.get("data", {})
+        # for stream in data["data"]["result"]:  # "data" 키 없으면 KeyError
+        for stream in result_data.get("result", []):
             labels = stream.get("stream", {})
-            for ts_ns, line in stream["values"]:
+            # for ts_ns, line in stream["values"]:  # "values" 없으면 KeyError
+            for ts_ns, line in stream.get("values", []):    
                 ts = int(ts_ns) // 10**9
                 dt = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
                 raw_logs.append({
@@ -276,8 +298,13 @@ class LokiQueryTool(BaseTool):
             **preprocessed,
         })
 
+    # async def _arun(self, **kwargs) -> str:
+    #     return self._run(**kwargs)
     async def _arun(self, **kwargs) -> str:
-        return self._run(**kwargs)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: self._run(**kwargs)
+    )
 
 
 # ── 독립 실행 테스트 ──────────────────────────────────────────────
@@ -294,9 +321,9 @@ if __name__ == "__main__":
     tool = LokiQueryTool()
 
     tests = [
-        ("web01-bank16",  "", "", "500"),
-        ("was01-bank16",  "", "OOM|OutOfMemory", ""),
-        ("db01-bank16",   "", "slow|timeout", ""),
+        ("web-bank16",  "", "", "500"),
+        ("was-bank16",  "", "OOM|OutOfMemory", ""),
+        ("db-bank16",   "", "slow|timeout", ""),
     ]
 
     for host, level, kw, sc in tests:

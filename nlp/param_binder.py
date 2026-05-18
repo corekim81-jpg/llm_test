@@ -28,6 +28,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
 from monitoring_llm.nlp.entity_extractor import ExtractedEntities
 from monitoring_llm.nlp.intent_classifier import QueryIntent
 from monitoring_llm.nlp.time_parser import TimeRange, default_range
@@ -122,11 +126,13 @@ class BoundParams:
 
 
 # ── CMDB 조회 ─────────────────────────────────────────────────────
-def _resolve_servers(entities: ExtractedEntities) -> list[dict]:
+# def _resolve_servers(entities: ExtractedEntities) -> list[dict]:
+def _resolve_servers(entities: ExtractedEntities, cmdb=None) -> list[dict]:    
     """IP/hostname → CMDB → 서버 파라미터 dict 반환"""
     try:
-        from monitoring_llm.cmdb.database import CMDB
-        cmdb = CMDB(CMDB_DB_PATH)
+        if cmdb is None:
+            from monitoring_llm.cmdb.database import CMDB
+            cmdb = CMDB(CMDB_DB_PATH)
     except Exception:
         return []
 
@@ -160,6 +166,7 @@ def bind_params(
     entities: ExtractedEntities,
     time_range: Optional[TimeRange],
     state: Optional[dict] = None,
+    cmdb=None
 ) -> BoundParams:
     """
     Intent + Entities + TimeRange → BoundParams
@@ -177,7 +184,7 @@ def bind_params(
     from_context = needs_context("", entities)  # 대명사 감지는 상위에서
 
     if entities.all_servers:
-        bp.servers = _resolve_servers(entities)
+        bp.servers = _resolve_servers(entities, cmdb=cmdb)  # cmdb 주입
     elif state and state.get("current_servers"):
         # 컨텍스트에서 이전 서버 가져오기
         bp.servers     = state["current_servers"]
@@ -245,21 +252,42 @@ if __name__ == "__main__":
     from monitoring_llm.nlp.time_parser import parse_time_expression, default_range
 
     # CMDB 초기화
-    cmdb = CMDB("/tmp/test_binder.db")
+    # cmdb = CMDB("/tmp/test_binder.db")
+    cmdb = CMDB("cmdb.db")    
     seed_banksystem_16(cmdb)
+    
+    # seed된 전체 서버 목록 출력
+    all_servers = cmdb.get_all()   # 혹은 cmdb.list_all() 등 조회 메서드
+    for s in all_servers:
+        print(f"  {s.ip} / {s.hostname} / {s.role}")
 
     TEST_CASES = [
-        ("어제 web01에서 500 에러가 왜 발생했어?",  QueryIntent.ERROR_ANALYSIS),
-        ("5월 6일 14시~16시 was01 메트릭 조회해줘", QueryIntent.METRIC_RANGE),
+        ("어제 web에서 500 에러가 왜 발생했어?",  QueryIntent.ERROR_ANALYSIS), # web01
+        ("5월 6일 14시~16시 was 메트릭 조회해줘", QueryIntent.METRIC_RANGE),   # was01
         ("문제있는 서버 메트릭이랑 로그 같이 보여줘", QueryIntent.MULTI_MODAL),
-        ("192.168.16.30 서버는 뭐하는 서버야?",     QueryIntent.ASSET_INFO),
+        ("192.168.0.63 서버는 뭐하는 서버야?",     QueryIntent.ASSET_INFO),
     ]
 
     print("파라미터 바인딩 테스트\n" + "="*55)
     for text, intent in TEST_CASES:
         entities  = extract_entities(text)
         time_range = parse_time_expression(text) or default_range(60)
-        bp = bind_params(intent, entities, time_range)
+        
+        
+        # ── 디버그 출력 ──────────────────────────
+        print(f"\n▶ 원문: {text}")
+        print(f"  entities.ips       = {entities.ips}")
+        print(f"  entities.hostnames = {entities.hostnames}")
+        print(f"  entities.all_servers = {entities.all_servers}")
+        
+        # CMDB resolve 직접 테스트
+        for identifier in entities.all_servers:
+            result = cmdb.resolve(identifier)
+            print(f"  cmdb.resolve({identifier!r}) = {result}")
+        # ────────────────────────────────────────
+        
+        
+        bp = bind_params(intent, entities, time_range, cmdb=cmdb)   # ← cmdb 전달
 
         print(f"\n[{intent.value}] {text}")
         print(f"  서버: {[s['hostname'] for s in bp.servers]}")
@@ -273,3 +301,10 @@ if __name__ == "__main__":
             print(f"  loki: level={bp.loki_level_filter}, "
                   f"keyword={bp.loki_keyword}, code={bp.loki_status_code}")
             print(f"  jaeger: services={bp.jaeger_services}, error_only={bp.jaeger_error_only}")
+        if intent == QueryIntent.ASSET_INFO and bp.servers:
+            s = bp.servers[0]
+            print(f"  hostname : {s['hostname']}")
+            print(f"  ip       : {s['ip']}")
+            print(f"  role     : {s['role']}")
+            print(f"  os       : {s['os']}")
+            print(f"  tier     : {s['tier']}")

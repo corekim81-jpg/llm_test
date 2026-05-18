@@ -225,17 +225,18 @@ RUNBOOKS: dict[str, dict] = {
 
 # 트리거 키워드 → Runbook 키 매핑 (에러 분류기 패턴명과 연결)
 PATTERN_TO_RUNBOOK: dict[str, str] = {
-    "OOM":               "OutOfMemoryError",
-    "GC_OVERHEAD":       "GC overhead",
-    "HTTP_500":          "500",
-    "HTTP_503":          "503",
-    "DB_ConnFail":       "Connection refused",
-    "DB_Deadlock":       "1213",
-    "DB_SlowQuery":      "DB_SlowQuery",
-    "AJP_Error":         "502",
-    "Disk_Full":         "No space left",
-    "ConnRefused":       "Connection refused",
-    "Timeout":           "Read timed out",
+    "OOM":          "OutOfMemoryError",
+    "GC_OVERHEAD":  "GC overhead",
+    "HTTP_500":     "500",
+    "HTTP_502":     "502",          # ← 이 한 줄만 추가
+    "HTTP_503":     "503",
+    "DB_ConnFail":  "Connection refused",
+    "DB_Deadlock":  "1213",
+    "DB_SlowQuery": "DB_SlowQuery",
+    "AJP_Error":    "502",
+    "Disk_Full":    "No space left",
+    "ConnRefused":  "Connection refused",
+    "Timeout":      "Read timed out",
 }
 
 
@@ -318,7 +319,8 @@ def recommend(
     risk_order = {"high": 0, "medium": 1, "low": 2}
     plans.sort(key=lambda p: risk_order.get(p.risk, 1))
 
-    if use_llm and plans:
+    # if use_llm and plans:
+    if use_llm and matched_keys:
         plans = _llm_refine(plans, error_patterns, rca_result)
 
     return plans
@@ -341,6 +343,40 @@ def to_markdown_report(plans: list[ActionPlan]) -> str:
 
 
 # ── LLM 조정 ─────────────────────────────────────────────────────────
+# def _llm_refine(
+#     plans: list[ActionPlan],
+#     patterns: list[str],
+#     rca_result: Optional[dict],
+# ) -> list[ActionPlan]:
+#     try:
+#         from langchain_ollama import ChatOllama
+#         from langchain_core.messages import HumanMessage, SystemMessage
+
+#         context = to_markdown_report(plans)
+#         rca_ctx = json.dumps(rca_result, ensure_ascii=False) if rca_result else "없음"
+
+#         llm = ChatOllama(
+#             model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL,
+#             temperature=0.2, num_predict=1500, num_ctx=4096,
+#         )
+#         prompt = (
+#             f"[현재 장애 상황]\n에러 패턴: {patterns}\nRCA 결과: {rca_ctx}\n\n"
+#             f"[기본 조치 플랜]\n{context}\n\n"
+#             "위 정보를 바탕으로 BankSystem_16 환경에 맞게 조치 플랜을 보완하세요.\n"
+#             "특히 즉시 조치 항목을 구체적인 명령어 수준으로 상세화하고,\n"
+#             "현재 상황과 무관한 항목은 제거하세요.\n"
+#             "형식은 기존 마크다운을 유지하세요."
+#         )
+#         resp = llm.invoke([
+#             SystemMessage(content="/no_think\n당신은 BankSystem_16 운영 전문가입니다. 실행 가능한 구체적 조치를 한국어로 제시하세요."),
+#             HumanMessage(content=prompt),
+#         ])
+#         # LLM 응답을 첫 번째 플랜의 즉시 조치에 추가 (원본 유지)
+#         plans[0].immediate.insert(0, f"[LLM 보완] {resp.content[:200]}")
+#     except Exception as e:
+#         log.warning(f"조치 LLM 보완 실패: {e}")
+#     return plans
+
 def _llm_refine(
     plans: list[ActionPlan],
     patterns: list[str],
@@ -357,23 +393,55 @@ def _llm_refine(
             model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL,
             temperature=0.2, num_predict=1500, num_ctx=4096,
         )
+
         prompt = (
             f"[현재 장애 상황]\n에러 패턴: {patterns}\nRCA 결과: {rca_ctx}\n\n"
             f"[기본 조치 플랜]\n{context}\n\n"
             "위 정보를 바탕으로 BankSystem_16 환경에 맞게 조치 플랜을 보완하세요.\n"
-            "특히 즉시 조치 항목을 구체적인 명령어 수준으로 상세화하고,\n"
-            "현재 상황과 무관한 항목은 제거하세요.\n"
-            "형식은 기존 마크다운을 유지하세요."
+            "즉시 조치 항목을 구체적인 명령어 수준으로 상세화하고,\n"
+            "현재 상황과 무관한 항목은 제거하세요.\n\n"
+            "반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.\n"
+            "[\n"
+            "  {\n"
+            '    "trigger": "트리거 설명",\n'
+            '    "immediate": ["즉시조치1", "즉시조치2"],\n'
+            '    "short_term": ["단기개선1", "단기개선2"],\n'
+            '    "monitor": ["지표1", "지표2"],\n'
+            '    "risk": "high|medium|low",\n'
+            '    "approval_required": true\n'
+            "  }\n"
+            "]"
         )
+
         resp = llm.invoke([
             SystemMessage(content="/no_think\n당신은 BankSystem_16 운영 전문가입니다. 실행 가능한 구체적 조치를 한국어로 제시하세요."),
             HumanMessage(content=prompt),
         ])
-        # LLM 응답을 첫 번째 플랜의 즉시 조치에 추가 (원본 유지)
-        plans[0].immediate.insert(0, f"[LLM 보완] {resp.content[:200]}")
+
+        # JSON 파싱 후 ActionPlan 전체 업데이트
+        raw = resp.content.strip().removeprefix("```json").removesuffix("```").strip()
+        refined = json.loads(raw)
+
+        updated: list[ActionPlan] = []
+        for i, item in enumerate(refined):
+            # LLM 응답 수가 기존 plans보다 적을 수 있으니 원본으로 fallback
+            base = plans[i] if i < len(plans) else plans[-1]
+            updated.append(ActionPlan(
+                trigger           = item.get("trigger",           base.trigger),
+                immediate         = item.get("immediate",         base.immediate),
+                short_term        = item.get("short_term",        base.short_term),
+                monitor           = item.get("monitor",           base.monitor),
+                risk              = item.get("risk",              base.risk),
+                approval_required = item.get("approval_required", base.approval_required),
+            ))
+        return updated if updated else plans
+
+    except json.JSONDecodeError as e:
+        log.warning(f"LLM 응답 JSON 파싱 실패: {e}\n원본 응답: {resp.content[:300]}")
+        return plans  # 파싱 실패 시 원본 플랜 반환
     except Exception as e:
         log.warning(f"조치 LLM 보완 실패: {e}")
-    return plans
+        return plans
 
 
 # ── 독립 실행 테스트 ──────────────────────────────────────────────────
@@ -389,7 +457,7 @@ if __name__ == "__main__":
 
     for patterns in scenarios:
         print(f"\n패턴: {patterns}")
-        plans = recommend(patterns, use_llm=False)
+        plans = recommend(patterns, use_llm=True)
         for plan in plans:
             risk_icon = {"low":"🟢","medium":"🟡","high":"🔴"}.get(plan.risk,"⚪")
             appr = "⚠️ 승인필요" if plan.approval_required else ""

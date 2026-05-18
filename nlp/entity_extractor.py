@@ -15,12 +15,22 @@ HOSTNAME_FULL_RE = re.compile(
     r'(?![a-zA-Z0-9_])',
     re.IGNORECASE,
 )
+# HOSTNAME_SHORT_RE = re.compile(
+#     r'(?<![a-zA-Z0-9_])'
+#     r'(web\d+|was\d+|db\d+|app\d+|proxy\d+|lb\d+|cache\d*|mq\d*|api\d*|auth\d+)'
+#     r'(?![a-zA-Z0-9_])',
+#     re.IGNORECASE,
+# )
+
+# 이름 뒤에 숫자 없어도 허용 
 HOSTNAME_SHORT_RE = re.compile(
     r'(?<![a-zA-Z0-9_])'
-    r'(web\d+|was\d+|db\d+|app\d+|proxy\d+|lb\d+|cache\d*|mq\d*|api\d*|auth\d+)'
+    r'(web\d*|was\d*|db\d*|app\d*|proxy\d*|lb\d*|cache\d*|mq\d*|api\d*|auth\d*)'
     r'(?![a-zA-Z0-9_])',
     re.IGNORECASE,
 )
+
+
 
 HTTP_ERROR_RE = re.compile(r'\b([45]\d{2})\b')
 MYSQL_ERROR_RE = re.compile(r'\b(1\d{3}|20\d{2})\b')
@@ -130,10 +140,10 @@ def needs_context(text: str, entities: ExtractedEntities) -> bool:
 
 if __name__ == '__main__':
     tests = [
-        ("192.168.16.10 서버는 뭐하는 서버야?", ['192.168.16.10'], [], []),
-        ("어제 web01에서 500 에러가 왜 발생했어?", [], ['web01'], ['500']),
-        ("was01-bank16 OOM 원인이 머지?",         [], ['was01-bank16'], ['OOM']),
-        ("db01 slow query랑 deadlock 확인해줘",    [], ['db01'], ['SLOW_QUERY', 'DEADLOCK']),
+        ("192.168.0.63 서버는 뭐하는 서버야?", ['192.168.16.10'], [], []),
+        ("어제 web에서 500 에러가 왜 발생했어?", [], ['web01'], ['500']),
+        ("was-bank16 OOM 원인이 머지?",         [], ['was01-bank16'], ['OOM']),
+        ("db slow query랑 deadlock 확인해줘",    [], ['db01'], ['SLOW_QUERY', 'DEADLOCK']),
         ("AJP connection refused 에러",           [], [], ['AJP', 'CONNECTION_REFUSED']),
         ("Tomcat heap GC overhead 문제",          [], [], ['GC_OVERHEAD']),
     ]

@@ -15,11 +15,16 @@ import json
 from datetime import datetime
 from typing import Type, Optional
 from pydantic import BaseModel, Field
+import asyncio
 
 try:
     from langchain_core.tools import BaseTool
 except ImportError:
     from langchain.tools import BaseTool
+    
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))    
 
 from monitoring_llm.tools.base import (
     PROMETHEUS_URL, MOCK_MODE, safe_get, ok, err, ts_to_str
@@ -92,8 +97,10 @@ PROMQL: dict[str, dict[str, str]] = {
             'rate(tomcat_errorcount_total{instance="{instance}"}[1m])'
         ),
         "req_processing_time_ms": (
+            # 'rate(tomcat_processingtime_total{instance="{instance}"}[1m])'
+            # ' / rate(tomcat_requestcount_total{instance="{instance}"}[1m])' # 분모가 0일 때 NaN이 발생
             'rate(tomcat_processingtime_total{instance="{instance}"}[1m])'
-            ' / rate(tomcat_requestcount_total{instance="{instance}"}[1m])'
+            ' / (rate(tomcat_requestcount_total{instance="{instance}"}[1m]) + 0.001)'
         ),
     },
 
@@ -112,11 +119,17 @@ PROMQL: dict[str, dict[str, str]] = {
         "slow_queries_per_sec": (
             'rate(mysql_global_status_slow_queries{instance="{instance}"}[1m])'
         ),
+        # "innodb_bp_hit_rate": (
+        #     '100 * ('
+        #     '  rate(mysql_global_status_innodb_buffer_pool_reads{instance="{instance}"}[1m])'  # data 없음 → hit
+        #     '  / (rate(mysql_global_status_innodb_buffer_pool_read_requests{instance="{instance}"}[1m]) + 0.001)'
+        #     ')'
+        # ),
         "innodb_bp_hit_rate": (
-            '100 * ('
-            '  rate(mysql_global_status_innodb_buffer_pool_reads{instance="{instance}"}[1m])'  # data 없음 → hit
+            '100 * (1 - ('
+            '  rate(mysql_global_status_innodb_buffer_pool_reads{instance="{instance}"}[1m])'
             '  / (rate(mysql_global_status_innodb_buffer_pool_read_requests{instance="{instance}"}[1m]) + 0.001)'
-            ')'
+            '))'
         ),
         "threads_running": (
             'mysql_global_status_threads_running{instance="{instance}"}'
@@ -205,7 +218,8 @@ def _run_range_query(
         return None
 
     nums_sorted = sorted(nums)
-    p95_idx = int(len(nums_sorted) * 0.95)
+    # p95_idx = int(len(nums_sorted) * 0.95) # 문제는 없으나 명시적 보호
+    p95_idx = min(int(len(nums_sorted) * 0.95), len(nums_sorted) - 1)
     return {
         "avg": round(sum(nums) / len(nums), 3),
         "max": round(max(nums), 3),
@@ -300,28 +314,68 @@ class PrometheusQueryTool(BaseTool):
 
         return ok(output)
 
+    # async def _arun(self, **kwargs) -> str:
+    #     return self._run(**kwargs)
     async def _arun(self, **kwargs) -> str:
-        return self._run(**kwargs)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: self._run(**kwargs)
+    )
 
+
+# def _detect_anomalies(role: str, metrics: dict) -> list[str]:
+#     """수집된 메트릭에서 임계값 초과 항목 자동 감지"""
+#     flags = []
+#     thresholds = {
+#         "web":  {"cpu_util_pct": 80, "mem_used_pct": 85, "disk_used_pct": 90,
+#                  "workers_busy": 180},
+#         "was":  {"heap_used_pct": 85, "threads_active": 190, "gc_time_rate": 0.1,
+#                  "error_per_sec": 1.0},
+#         "db":   {"connections_max_pct": 70, "slow_queries_per_sec": 5.0,
+#                  "threads_running": 30},
+#     }
+#     limits = thresholds.get(role, {})
+#     for metric, limit in limits.items():
+#         val = metrics.get(metric, {})
+#         if isinstance(val, dict) and val.get("max", 0) > limit:
+#             flags.append(
+#                 f"{metric} 임계값 초과: max={val['max']} (기준={limit})"
+#             )
+#     return flags
+
+from monitoring_llm.tools.config import ANOMALY_THRESHOLDS
 
 def _detect_anomalies(role: str, metrics: dict) -> list[str]:
-    """수집된 메트릭에서 임계값 초과 항목 자동 감지"""
+    """
+    수집된 메트릭에서 이상 징후 자동 감지.
+    - max 기준: 순간 스파이크 감지
+    - p95 기준: 지속적 고부하 감지 (max 임계값의 p95_ratio 초과 시)
+    """
     flags = []
-    thresholds = {
-        "web":  {"cpu_util_pct": 80, "mem_used_pct": 85, "disk_used_pct": 90,
-                 "workers_busy": 180},
-        "was":  {"heap_used_pct": 85, "threads_active": 190, "gc_time_rate": 0.1,
-                 "error_per_sec": 1.0},
-        "db":   {"connections_max_pct": 70, "slow_queries_per_sec": 5.0,
-                 "threads_running": 30},
-    }
-    limits = thresholds.get(role, {})
-    for metric, limit in limits.items():
-        val = metrics.get(metric, {})
-        if isinstance(val, dict) and val.get("max", 0) > limit:
+    limits = ANOMALY_THRESHOLDS.get(role, {})
+
+    for metric, cfg in limits.items():
+        val = metrics.get(metric)
+        if not isinstance(val, dict):
+            continue
+
+        max_limit = cfg["max_limit"]
+        p95_ratio = cfg["p95_ratio"]
+        v_max = val.get("max", 0)
+        v_p95 = val.get("p95", 0)
+
+        # ① 순간 스파이크 감지 (max 기준)
+        if v_max > max_limit:
             flags.append(
-                f"{metric} 임계값 초과: max={val['max']} (기준={limit})"
+                f"[스파이크] {metric}: max={v_max} > 임계값={max_limit}"
             )
+
+        # ② 지속 고부하 감지 (p95 기준) — 스파이크와 독립적으로 판단
+        elif v_p95 > max_limit * p95_ratio:
+            flags.append(
+                f"[지속고부하] {metric}: p95={v_p95} > 기준={round(max_limit * p95_ratio, 3)}"
+            )
+
     return flags
 
 
@@ -338,9 +392,9 @@ if __name__ == "__main__":
     tool = PrometheusQueryTool()
 
     test_cases = [
-        ("web01-bank16", "web", "192.168.16.10:9117"),
-        ("was01-bank16", "was", "192.168.16.20:9090"),
-        ("db01-bank16",  "db",  "192.168.16.30:9104"),
+        ("web-bank16", "web", "192.168.16.10:9117"),
+        ("was-bank16", "was", "192.168.16.20:9090"),
+        ("db-bank16",  "db",  "192.168.16.30:9104"),
     ]
 
     for hostname, role, instance in test_cases:

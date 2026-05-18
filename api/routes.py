@@ -21,6 +21,7 @@ import os
 import asyncio
 import logging
 from typing import Optional, AsyncGenerator
+import httpx  # ✅ requests → httpx 교체
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -61,20 +62,29 @@ async def chat_stream(req: ChatRequest, request: Request):
     store = get_store()
     sid, state = store.get_or_create(req.session_id)
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        async for chunk in stream_agent(req.message, state, sid):
+    async def event_generator() -> AsyncGenerator[str, None]:        
+        # ✅ out_state: stream_agent가 최종 상태를 채워줌 → run_query 재실행 불필요
+        out_state: dict = {}
+        # async for chunk in stream_agent(req.message, state, sid):
+        async for chunk in stream_agent(req.message, state, sid, out_state):
             if await request.is_disconnected():
                 log.info(f"[SSE] 연결 끊김: {sid}")
                 break
             yield chunk
 
-        # 스트리밍 완료 후 세션 상태 갱신 (별도 실행)
-        try:
-            from monitoring_llm.agent.graph import run_query
-            _, updated = await asyncio.to_thread(run_query, req.message, state)
-            store.update(sid, updated)
-        except Exception as e:
-            log.error(f"[Session] 상태 저장 실패: {e}")
+        # # 스트리밍 완료 후 세션 상태 갱신 (별도 실행)
+        # try:
+        #     from monitoring_llm.agent.graph import run_query
+        #     _, updated = await asyncio.to_thread(run_query, req.message, state)
+        #     store.update(sid, updated)
+        # except Exception as e:
+        #     log.error(f"[Session] 상태 저장 실패: {e}")
+        # ✅ stream_agent가 채운 out_state로 세션 갱신 (LLM 2회 호출 제거)
+        if out_state:
+            store.update(sid, out_state)
+        else:
+            log.warning(f"[Session] out_state 비어있음, 세션 갱신 생략: {sid}")
+
 
     return StreamingResponse(
         event_generator(),
@@ -139,7 +149,7 @@ async def list_sessions():
 # ── 엔드포인트 4: 헬스체크 ──────────────────────────────────────────
 @router.get("/health")
 async def health_check():
-    import requests
+    # import requests
     from datetime import datetime
 
     endpoints = [
@@ -149,14 +159,31 @@ async def health_check():
         ("ollama",     os.getenv("OLLAMA_BASE_URL", "http://localhost:11434") + "/api/tags"),
     ]
     checks: dict[str, str] = {}
-    for name, url in endpoints:
-        try:
-            r = requests.get(url, timeout=3)
-            checks[name] = "ok" if r.status_code < 400 else f"http_{r.status_code}"
-        except requests.exceptions.ConnectionError:
-            checks[name] = "unreachable"
-        except Exception as e:
-            checks[name] = f"error:{str(e)[:25]}"
+    # for name, url in endpoints:
+    #     try:
+    #         r = requests.get(url, timeout=3)
+    #         checks[name] = "ok" if r.status_code < 400 else f"http_{r.status_code}"
+    #     except requests.exceptions.ConnectionError:
+    #         checks[name] = "unreachable"
+    #     except Exception as e:
+    #         checks[name] = f"error:{str(e)[:25]}"
+    
+    # ✅ httpx.AsyncClient: 4개 요청을 이벤트 루프 블로킹 없이 동시에 처리
+    async with httpx.AsyncClient() as client:
+        tasks = {
+            name: client.get(url, timeout=3.0)
+            for name, url in endpoints
+        }
+        for name, coro in tasks.items():
+            try:
+                r = await coro
+                checks[name] = "ok" if r.status_code < 400 else f"http_{r.status_code}"
+            except httpx.ConnectError:
+                checks[name] = "unreachable"
+            except httpx.TimeoutException:
+                checks[name] = "timeout"
+            except Exception as e:
+                checks[name] = f"error:{str(e)[:25]}"
 
     status = "healthy" if all(v == "ok" for v in checks.values()) else "degraded"
     return {

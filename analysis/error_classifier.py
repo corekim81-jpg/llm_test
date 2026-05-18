@@ -16,10 +16,19 @@ analysis/error_classifier.py — 에러 분류기
 
 from __future__ import annotations
 
+import os 
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
 import re
 import json
 import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from monitoring_llm.analysis.log_analyzer import LogAnalysisResult
+
 from typing import Optional
 
 log = logging.getLogger("monitoring_llm.analysis")
@@ -69,11 +78,41 @@ JVM_TAXONOMY: dict[str, dict] = {
     },
 }
 
+
 SYS_TAXONOMY: dict[str, dict] = {
-    "No space left":    {"name": "디스크 풀",      "cause": "logrotate 강제 실행 후 용량 확보"},
+    "No space left":     {"name": "디스크 풀",     "cause": "logrotate 강제 실행 후 용량 확보"},
     "Connection refused":{"name": "연결 거부",     "cause": "대상 서비스 다운 또는 방화벽 차단"},
-    "Read timed out":   {"name": "읽기 타임아웃",  "cause": "네트워크 지연 또는 대상 서비스 느림"},
-    "ENOSPC":           {"name": "디스크 풀(OS)",  "cause": "파일시스템 마운트 포인트 용량 0"},
+    "Read timed out":    {"name": "읽기 타임아웃", "cause": "네트워크 지연 또는 대상 서비스 느림"},
+    "ENOSPC":            {"name": "디스크 풀(OS)", "cause": "파일시스템 마운트 포인트 용량 0"},
+    "Thread pool full":  {"name": "스레드풀 고갈", "cause": "maxThreads 초과 — 스레드 설정 증설 또는 slow 요청 제거"},
+}
+
+
+# ── 위험도 아이콘 (공통 상수) ─────────────────────────────────────────
+RISK_ICON: dict[str, str] = {"low": "🟢", "medium": "🟡", "high": "🔴"}
+
+# ── 패턴명 → (category, code) 매핑 ───────────────────────────────────
+PATTERN_TO_CAT: dict[str, tuple[str, str]] = {
+    "OOM":               ("JVM", "OutOfMemoryError"),
+    "GC_OVERHEAD":       ("JVM", "GC overhead"),        # ✅ 추가
+    "NPE":               ("JVM", "NullPointerException"),
+    "AJP_Error":         ("SYS", "Connection refused"),
+    "DB_ConnFail":       ("DB",  "2003"),
+    "DB_Deadlock":       ("DB",  "1213"),
+    "DB_SlowQuery":      ("DB",  "slow_query"),
+    "HTTP_500":          ("HTTP","500"),
+    "HTTP_502":          ("HTTP","502"),                 # ✅ 추가
+    "HTTP_503":          ("HTTP","503"),
+    "Disk_Full":         ("SYS", "No space left"),
+    "ConnRefused":       ("SYS", "Connection refused"),
+    "Timeout":           ("SYS", "Read timed out"),
+    "ThreadPoolExhaust": ("SYS", "Thread pool full"),   # ✅ SYS_TAXONOMY와 연결
+}
+
+# Apache/Nginx 공통 로그 형식: "METHOD /path HTTP/x.x" STATUS SIZE
+_HTTP_CODE_RE = {
+    code: re.compile(rf'" {code} \d+')
+    for code in HTTP_TAXONOMY
 }
 
 
@@ -130,46 +169,51 @@ def classify_from_logs(log_result: LogAnalysisResult | dict) -> ErrorReport:
     """
     log_analyzer.LogAnalysisResult 또는 raw dict에서 에러를 분류.
     """
-    from monitoring_llm.analysis.log_analyzer import LogAnalysisResult
+    # 모듈 상단 TYPE_CHECKING으로 타입 힌트 처리,
+    # 런타임 import는 여기서 한 번만
+    from monitoring_llm.analysis.log_analyzer import LogAnalysisResult, preprocess
 
     if isinstance(log_result, dict):
-        from monitoring_llm.analysis.log_analyzer import preprocess
+        # from monitoring_llm.analysis.log_analyzer import preprocess
         log_result = preprocess(log_result)
 
     report = ErrorReport()
 
-    # ── 패턴 기반 분류 ────────────────────────────────────────────────
-    pattern_to_cat = {
-        "OOM":               ("JVM",  "OutOfMemoryError"),
-        "NPE":               ("JVM",  "NullPointerException"),
-        "AJP_Error":         ("SYS",  "Connection refused"),
-        "DB_ConnFail":       ("DB",   "2003"),
-        "DB_Deadlock":       ("DB",   "1213"),
-        "DB_SlowQuery":      ("DB",   "slow_query"),
-        "HTTP_500":          ("HTTP", "500"),
-        "HTTP_503":          ("HTTP", "503"),
-        "Disk_Full":         ("SYS",  "No space left"),
-        "ConnRefused":       ("SYS",  "Connection refused"),
-        "Timeout":           ("SYS",  "Read timed out"),
-        "ThreadPoolExhaust": ("WAS",  "Thread pool full"),
-    }
+    # ── ① 패턴 기반 분류 ──────────────────────────────────────────────
+    # pattern_to_cat = {
+    #     "OOM":               ("JVM",  "OutOfMemoryError"),
+    #     "NPE":               ("JVM",  "NullPointerException"),
+    #     "AJP_Error":         ("SYS",  "Connection refused"),
+    #     "DB_ConnFail":       ("DB",   "2003"),
+    #     "DB_Deadlock":       ("DB",   "1213"),
+    #     "DB_SlowQuery":      ("DB",   "slow_query"),
+    #     "HTTP_500":          ("HTTP", "500"),
+    #     "HTTP_503":          ("HTTP", "503"),
+    #     "Disk_Full":         ("SYS",  "No space left"),
+    #     "ConnRefused":       ("SYS",  "Connection refused"),
+    #     "Timeout":           ("SYS",  "Read timed out"),
+    #     "ThreadPoolExhaust": ("WAS",  "Thread pool full"),
+    # }
 
     for pat_name, cnt in log_result.patterns.items():
-        if pat_name not in pattern_to_cat:
+        if pat_name not in PATTERN_TO_CAT:
             continue
-        cat, code = pattern_to_cat[pat_name]
+        cat, code = PATTERN_TO_CAT[pat_name]
         item = _build_error_item(code, cat, cnt)
         item.trace_ids = log_result.trace_ids[:3]
         report.errors.append(item)
 
-    # ── HTTP 에러코드 빈도 집계 ───────────────────────────────────────
+    # ── ② HTTP 에러코드 빈도 집계 (위치 한정 정규식) ─
     for entry in log_result.key_logs:
         line = entry.get("log", "")
-        for code in HTTP_TAXONOMY:
-            if re.search(rf'\b{code}\b', line):
+        # for code in HTTP_TAXONOMY:
+            # if re.search(rf'\b{code}\b', line):
+        for code, pattern in _HTTP_CODE_RE.items():
+            if pattern.search(line):
                 report.http_error_freq[code] = report.http_error_freq.get(code, 0) + 1
 
     # HTTP 빈도 기반 ErrorItem 추가 (미분류분)
+    # ── ③ 미분류 HTTP 코드 추가 ───────────────────────────────────────
     existing_http = {e.code for e in report.errors if e.category == "HTTP"}
     for code, cnt in report.http_error_freq.items():
         if code not in existing_http:
@@ -197,17 +241,33 @@ def correlate_with_traces(report: ErrorReport, jaeger_json: str | dict) -> Error
         data = jaeger_json
 
     traces = data.get("traces", [])
+    seen: set[str] = set()
+    
+    # for t in traces:
+    #     trace_id = t.get("traceID", "")
+    #     # 로그 TraceID와 교차 확인
+    #     for err in report.errors:
+    #         if any(tid in trace_id for tid in err.trace_ids):
+    #             if t not in report.correlated_traces:
+    #                 report.correlated_traces.append(t)
+    #     # 에러 트레이스는 무조건 포함
+    #     if t.get("error_count", 0) > 0:
+    #         if t not in report.correlated_traces:
+    #             report.correlated_traces.append(t)
+    
     for t in traces:
         trace_id = t.get("traceID", "")
-        # 로그 TraceID와 교차 확인
+
+        # ✅ 완전 일치 비교
         for err in report.errors:
-            if any(tid in trace_id for tid in err.trace_ids):
-                if t not in report.correlated_traces:
-                    report.correlated_traces.append(t)
-        # 에러 트레이스는 무조건 포함
-        if t.get("error_count", 0) > 0:
-            if t not in report.correlated_traces:
+            if trace_id in err.trace_ids and trace_id not in seen:
                 report.correlated_traces.append(t)
+                seen.add(trace_id)
+
+        # 에러 스팬이 있는 트레이스는 무조건 포함
+        if t.get("error_count", 0) > 0 and trace_id not in seen:
+            report.correlated_traces.append(t)
+            seen.add(trace_id)
 
     return report
 
@@ -245,27 +305,61 @@ def _infer_root_layer(errors: list[ErrorItem]) -> str:
 
 # ── 독립 실행 테스트 ──────────────────────────────────────────────────
 if __name__ == "__main__":
+    # import sys; sys.path.insert(0, "../..")
+    # from monitoring_llm.analysis.log_analyzer import preprocess, SAMPLE_LOKI  # type: ignore
+
+    # SAMPLE = {
+    #     "total": 9, "unique": 7,
+    #     "level_counts": {"ERROR": 7, "WARN": 2},
+    #     "patterns": {"OOM": 2, "HTTP_500": 3, "AJP_Error": 1, "Timeout": 2},
+    #     "key_logs": [
+    #         {"time":"14:32:01","level":"ERROR","log":'[ERROR] "POST /api/transfer HTTP/1.1" 500 1234 traceId=abc123'},
+    #         {"time":"14:32:03","level":"ERROR","log":"[ERROR] java.lang.OutOfMemoryError: Java heap space"},
+    #         {"time":"14:32:10","level":"ERROR","log":"[ERROR] AJP error: connection refused"},
+    #     ],
+    #     "error_timeline": {"14:32": 5, "14:33": 3, "14:34": 1},
+    #     "trace_ids": ["abc123def456"],
+    # }
+
+    # from monitoring_llm.analysis.log_analyzer import preprocess
+    # log_res = preprocess(SAMPLE)
+    # report  = classify_from_logs(log_res)
+
+    # print("에러 분류 결과\n" + "="*50)
+    # print(f"발생 계층 추정: {report.root_layer}")
+    # print(f"에러 종류 {len(report.errors)}개:")
+    # for e in report.top_errors:
+    #     print(f"  [{e.category}] {e.code} {e.name} {e.count}건")
+    #     print(f"    원인: {e.cause}")
+    # print(f"\n프롬프트 텍스트:\n{report.to_prompt_text()}")
+    
     import sys; sys.path.insert(0, "../..")
-    from monitoring_llm.analysis.log_analyzer import preprocess, SAMPLE_LOKI  # type: ignore
+    from monitoring_llm.analysis.log_analyzer import preprocess
 
     SAMPLE = {
         "total": 9, "unique": 7,
         "level_counts": {"ERROR": 7, "WARN": 2},
-        "patterns": {"OOM": 2, "HTTP_500": 3, "AJP_Error": 1, "Timeout": 2},
+        "patterns": {
+            "OOM": 2, "GC_OVERHEAD": 1, "HTTP_500": 3,
+            "HTTP_502": 1, "AJP_Error": 1, "Timeout": 2,
+            "ThreadPoolExhaust": 1,
+        },
         "key_logs": [
-            {"time":"14:32:01","level":"ERROR","log":'[ERROR] "POST /api/transfer HTTP/1.1" 500 1234 traceId=abc123'},
-            {"time":"14:32:03","level":"ERROR","log":"[ERROR] java.lang.OutOfMemoryError: Java heap space"},
-            {"time":"14:32:10","level":"ERROR","log":"[ERROR] AJP error: connection refused"},
+            {"time": "14:32:01", "level": "ERROR",
+             "log": '[ERROR] "POST /api/transfer HTTP/1.1" 500 1234 traceId=abc123'},
+            {"time": "14:32:02", "level": "ERROR",
+             "log": '[ERROR] "GET /api/account HTTP/1.1" 502 0'},
+            {"time": "14:32:03", "level": "ERROR",
+             "log": "[ERROR] java.lang.OutOfMemoryError: Java heap space"},
         ],
-        "error_timeline": {"14:32": 5, "14:33": 3, "14:34": 1},
+        "error_timeline": {"14:32": 5, "14:33": 3},
         "trace_ids": ["abc123def456"],
     }
 
-    from monitoring_llm.analysis.log_analyzer import preprocess
     log_res = preprocess(SAMPLE)
     report  = classify_from_logs(log_res)
 
-    print("에러 분류 결과\n" + "="*50)
+    print("에러 분류 결과\n" + "=" * 50)
     print(f"발생 계층 추정: {report.root_layer}")
     print(f"에러 종류 {len(report.errors)}개:")
     for e in report.top_errors:
