@@ -36,10 +36,16 @@ try:
 except ImportError:
     pass  # python-dotenv 없어도 동작 — 환경변수를 직접 export 하면 됨
 
+import pathlib
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from monitoring_llm.api.routes import router as monitoring_router
+
+_STATIC_DIR = pathlib.Path(__file__).parent.parent / "static"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,10 +75,19 @@ def create_app() -> FastAPI:
     # 모니터링 LLM 라우터 등록
     app.include_router(monitoring_router, prefix="/monitoring")
 
+    # 정적 파일 서빙 (index.html 등)
+    if _STATIC_DIR.exists():
+        app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    @app.get("/ui", tags=["ui"])
+    async def ui():
+        return FileResponse(_STATIC_DIR / "index.html")
+
     @app.get("/", tags=["root"])
     async def root():
         return {
             "service": "Monitoring LLM API",
+            "ui":      "/ui",
             "docs":    "/docs",
             "health":  "/monitoring/health",
             "chat":    "/monitoring/chat",

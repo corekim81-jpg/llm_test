@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from typing import AsyncGenerator
 
 log = logging.getLogger("monitoring_llm.api")
@@ -69,37 +70,56 @@ async def stream_agent(
     await asyncio.sleep(0)
 
     final_response = ""
-    updated_state = dict(session_state)
+    updated_state  = dict(session_state)
+
+    # ── 동기 제너레이터를 스레드에서 실행하고 asyncio.Queue 로 실시간 전달 ──
+    loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
+    q: asyncio.Queue = asyncio.Queue()
+
+    def _run_sync() -> None:
+        try:
+            for evt in stream_query(user_input, session_state):
+                asyncio.run_coroutine_threadsafe(q.put(evt), loop)
+        except Exception as exc:
+            asyncio.run_coroutine_threadsafe(
+                q.put({"type": "__error__", "message": str(exc)}), loop
+            )
+        finally:
+            asyncio.run_coroutine_threadsafe(q.put(None), loop)  # sentinel
+
+    threading.Thread(target=_run_sync, daemon=True).start()
 
     try:
-        # stream_query 는 동기 제너레이터 → asyncio.to_thread 에서 실행
-        events = await asyncio.to_thread(
-            lambda: list(stream_query(user_input, session_state))
-        )
+        while True:
+            event = await q.get()
+            if event is None:          # sentinel → 종료
+                break
 
-        for event in events:
             etype = event.get("type")
 
-            if etype == "node":
+            if etype == "__error__":
+                log.error(f"[SSE] 그래프 실행 오류: {event.get('message')}")
+                yield sse_event(
+                    {"type": "error", "message": event.get("message", "오류 발생")},
+                    event="error",
+                )
+                return
+
+            elif etype == "node":
                 node_name = event.get("name", "")
                 node_data = event.get("data", {})
-                message = NODE_MESSAGES.get(node_name, f"{node_name} 처리 중...")
-
-                # 노드 데이터에서 유용한 정보 추출
-                detail = _extract_node_detail(node_name, node_data)
+                message   = NODE_MESSAGES.get(node_name, f"{node_name} 처리 중...")
+                detail    = _extract_node_detail(node_name, node_data)
 
                 yield sse_event(
                     {
-                        "type": "progress",
-                        "node": node_name,
+                        "type":    "progress",
+                        "node":    node_name,
                         "message": message,
-                        "detail": detail,
+                        "detail":  detail,
                     },
                     event="progress",
                 )
-                await asyncio.sleep(0.05)
-
-                # 상태 누적
                 updated_state.update(node_data)
 
             elif etype == "done":
@@ -120,28 +140,22 @@ async def stream_agent(
         ]
         yield sse_event(
             {
-                "type": "done",
+                "type":       "done",
                 "session_id": session_id,
-                "intent": updated_state.get("last_intent", "unknown"),
-                "servers": servers,
+                "intent":     updated_state.get("last_intent", "unknown"),
+                "servers":    servers,
                 "time_range": str(updated_state.get("last_time_range") or ""),
-                "response": final_response,
+                "response":   final_response,
             },
             event="done",
         )
 
-        # ✅ 호출자에게 최종 상태 전달 (run_query 재실행 불필요)
         if out_state is not None:
             out_state.update(updated_state)
 
     except Exception as e:
         log.error(f"[SSE] 스트리밍 오류: {e}", exc_info=True)
-        yield sse_event(
-            {"type": "error", "message": str(e)},
-            event="error",
-        )
-
-    return  # async generator는 값 반환 불가
+        yield sse_event({"type": "error", "message": str(e)}, event="error")
 
 
 def _extract_node_detail(node_name: str, data: dict) -> str:

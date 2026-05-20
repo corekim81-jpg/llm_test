@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Monitoring LLM — BankSystem_16</title>
+  <style>
+    :root {
+      --bg:          #0f1117;
+      --surface:     #1a1d27;
+      --surface2:    #252836;
+      --border:      #2d3149;
+      --accent:      #4f8ef7;
+      --accent-dim:  #1e3460;
+      --text:        #e0e4f0;
+      --text-dim:    #8892b0;
+      --green:       #43d9ad;
+      --red:         #ff6b6b;
+      --user-bubble: #1e3a5f;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Header ──────────────────────────────────────────────── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      height: 52px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .session-badge {
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      background: var(--surface2);
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-family: monospace;
+    }
+
+    .header-right {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .header-right span {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+    }
+
+    .health-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      transition: background 0.4s;
+      cursor: default;
+    }
+    .health-dot.ok  { background: var(--green); }
+    .health-dot.err { background: var(--red);   }
+
+    .new-chat-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-dim);
+      padding: 4px 12px;
+      font-size: 0.78rem;
+      cursor: pointer;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    .new-chat-btn:hover { border-color: var(--accent); color: var(--text); }
+
+    /* ── Chat scroll area ────────────────────────────────────── */
+    #chat {
+      flex: 1;
+      overflow-y: auto;
+      padding: 28px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    #chat::-webkit-scrollbar { width: 5px; }
+    #chat::-webkit-scrollbar-track { background: transparent; }
+    #chat::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── Welcome ─────────────────────────────────────────────── */
+    #welcome {
+      text-align: center;
+      padding: 60px 24px 20px;
+      color: var(--text-dim);
+    }
+    #welcome h2 { font-size: 1.4rem; color: var(--text); margin-bottom: 8px; }
+    #welcome p  { font-size: 0.88rem; margin-bottom: 28px; }
+
+    .examples {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+    }
+    .example-btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      padding: 7px 15px;
+      border-radius: 20px;
+      font-size: 0.82rem;
+      cursor: pointer;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    .example-btn:hover { border-color: var(--accent); color: var(--text); }
+
+    /* ── Message row ─────────────────────────────────────────── */
+    .msg {
+      display: flex;
+      flex-direction: column;
+      max-width: 78%;
+    }
+    .msg.user { align-self: flex-end; align-items: flex-end; }
+    .msg.ai   { align-self: flex-start; align-items: flex-start; }
+
+    .bubble {
+      padding: 12px 16px;
+      border-radius: 14px;
+      line-height: 1.65;
+      word-break: break-word;
+    }
+
+    .msg.user .bubble {
+      background: var(--user-bubble);
+      border-bottom-right-radius: 4px;
+      white-space: pre-wrap;
+    }
+
+    .msg.ai .bubble {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 4px;
+      min-width: 220px;
+    }
+
+    /* ── Progress steps inside AI bubble ────────────────────── */
+    .progress-list {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      margin-bottom: 6px;
+    }
+
+    .progress-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      font-size: 0.78rem;
+      color: var(--text-dim);
+    }
+
+    .step-icon {
+      flex-shrink: 0;
+      width: 14px;
+      height: 14px;
+      margin-top: 1px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .spinner {
+      width: 12px;
+      height: 12px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .check-icon { color: var(--green); font-size: 11px; }
+
+    .step-text  { flex: 1; }
+    .step-detail {
+      opacity: 0.6;
+      font-size: 0.72em;
+      margin-left: 4px;
+    }
+
+    /* ── Response text ───────────────────────────────────────── */
+    .response-text { white-space: pre-wrap; }
+
+    /* cursor blink while streaming */
+    .cursor::after {
+      content: '▍';
+      animation: blink 0.9s step-end infinite;
+      color: var(--accent);
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+    /* ── Meta badges ─────────────────────────────────────────── */
+    .msg-meta {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 5px;
+    }
+
+    .badge {
+      font-size: 0.68rem;
+      padding: 2px 9px;
+      border-radius: 10px;
+      font-family: monospace;
+    }
+    .badge.intent { background: var(--accent-dim); color: var(--accent); }
+    .badge.server { background: var(--surface2);   color: var(--text-dim); }
+
+    .msg-time {
+      font-size: 0.68rem;
+      color: var(--text-dim);
+      margin-top: 4px;
+    }
+
+    /* ── Input area ──────────────────────────────────────────── */
+    #input-area {
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+      flex-shrink: 0;
+    }
+
+    #input {
+      flex: 1;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 11px 15px;
+      color: var(--text);
+      font-size: 0.92rem;
+      font-family: inherit;
+      resize: none;
+      max-height: 130px;
+      outline: none;
+      transition: border-color 0.2s;
+      line-height: 1.5;
+    }
+    #input:focus { border-color: var(--accent); }
+    #input::placeholder { color: var(--text-dim); }
+
+    #send-btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 10px 22px;
+      font-size: 0.88rem;
+      font-family: inherit;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: opacity 0.2s;
+      height: 40px;
+    }
+    #send-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    #send-btn:hover:not(:disabled) { opacity: 0.85; }
+
+    .hint {
+      font-size: 0.68rem;
+      color: var(--text-dim);
+      text-align: right;
+      padding: 0 24px 8px;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────────────────── -->
+<header>
+  <h1>Monitoring LLM</h1>
+  <span class="session-badge" id="session-badge">새 세션</span>
+  <div class="header-right">
+    <span id="health-label">백엔드</span>
+    <div class="health-dot" id="health-dot" title="헬스 체크 중..."></div>
+    <button class="new-chat-btn" onclick="newChat()">새 대화</button>
+  </div>
+</header>
+
+<!-- ── Chat area ────────────────────────────────────────────────────── -->
+<div id="chat">
+  <div id="welcome">
+    <h2>BankSystem_16 모니터링 AI</h2>
+    <p>인프라 현황, 장애 이력, 에러 분석 등을 자연어로 질문하세요.</p>
+    <div class="examples">
+      <button class="example-btn" onclick="useExample(this)">어제 was01에서 무슨 문제가 있었어?</button>
+      <button class="example-btn" onclick="useExample(this)">최근 1시간 CPU 사용률 알려줘</button>
+      <button class="example-btn" onclick="useExample(this)">db01 서버 정보 보여줘</button>
+      <button class="example-btn" onclick="useExample(this)">500 에러 왜 발생했어?</button>
+      <button class="example-btn" onclick="useExample(this)">web01 메모리 사용량은?</button>
+      <button class="example-btn" onclick="useExample(this)">was02 지금 상태 어때?</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Input ─────────────────────────────────────────────────────────── -->
+<div id="input-area">
+  <textarea id="input" rows="1"
+    placeholder="질문을 입력하세요... (Enter: 전송 / Shift+Enter: 줄바꿈)"></textarea>
+  <button id="send-btn" onclick="send()">전송</button>
+</div>
+<div class="hint">Enter: 전송 &nbsp;·&nbsp; Shift+Enter: 줄바꿈</div>
+
+<script>
+// ─── State ────────────────────────────────────────────────────────────────────
+let sessionId    = localStorage.getItem('monitoring_llm_sid') || null;
+let isStreaming  = false;
+
+// working DOM refs for the current AI message being built
+let $progressList = null;
+let $responseText = null;
+let $msgMeta      = null;
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+updateBadge();
+checkHealth();
+setInterval(checkHealth, 30_000);
+
+document.getElementById('input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+document.getElementById('input').addEventListener('input', autoResize);
+
+function autoResize() {
+  const el = document.getElementById('input');
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 130) + 'px';
+}
+
+// ─── Session ──────────────────────────────────────────────────────────────────
+function updateBadge() {
+  const el = document.getElementById('session-badge');
+  el.textContent = sessionId
+    ? '세션: ' + sessionId.slice(0, 8) + '…'
+    : '새 세션';
+}
+
+function newChat() {
+  if (isStreaming) return;
+  sessionId = null;
+  localStorage.removeItem('monitoring_llm_sid');
+  updateBadge();
+  const chat = document.getElementById('chat');
+  chat.innerHTML = `
+    <div id="welcome">
+      <h2>BankSystem_16 모니터링 AI</h2>
+      <p>인프라 현황, 장애 이력, 에러 분석 등을 자연어로 질문하세요.</p>
+      <div class="examples">
+        <button class="example-btn" onclick="useExample(this)">어제 was01에서 무슨 문제가 있었어?</button>
+        <button class="example-btn" onclick="useExample(this)">최근 1시간 CPU 사용률 알려줘</button>
+        <button class="example-btn" onclick="useExample(this)">db01 서버 정보 보여줘</button>
+        <button class="example-btn" onclick="useExample(this)">500 에러 왜 발생했어?</button>
+        <button class="example-btn" onclick="useExample(this)">web01 메모리 사용량은?</button>
+        <button class="example-btn" onclick="useExample(this)">was02 지금 상태 어때?</button>
+      </div>
+    </div>`;
+}
+
+// ─── Health check ─────────────────────────────────────────────────────────────
+async function checkHealth() {
+  const dot   = document.getElementById('health-dot');
+  const label = document.getElementById('health-label');
+  try {
+    const r    = await fetch('/monitoring/health');
+    const data = await r.json();
+    const ok   = data.status === 'healthy';
+    dot.className = 'health-dot ' + (ok ? 'ok' : 'err');
+
+    const summary = Object.entries(data.checks)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join('\n');
+    dot.title = `상태: ${data.status}\n${summary}\n활성 세션: ${data.active_sessions}`;
+    label.textContent = ok ? '정상' : '일부 오류';
+  } catch {
+    dot.className = 'health-dot err';
+    dot.title     = '서버 연결 실패';
+    label.textContent = '연결 끊김';
+  }
+}
+
+// ─── Send ─────────────────────────────────────────────────────────────────────
+function useExample(btn) {
+  document.getElementById('input').value = btn.textContent;
+  send();
+}
+
+async function send() {
+  if (isStreaming) return;
+  const inputEl = document.getElementById('input');
+  const text    = inputEl.value.trim();
+  if (!text) return;
+
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+  isStreaming = true;
+  document.getElementById('send-btn').disabled = true;
+
+  // Remove welcome screen on first message
+  document.getElementById('welcome')?.remove();
+
+  appendUserMsg(text);
+  createAiMsg();                   // sets $progressList / $responseText / $msgMeta
+
+  try {
+    const res = await fetch('/monitoring/chat', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ message: text, session_id: sessionId }),
+    });
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let   buffer  = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Split on double-newline (SSE event boundary)
+      const blocks = buffer.split('\n\n');
+      buffer = blocks.pop();          // keep trailing incomplete block
+
+      for (const block of blocks) {
+        const evt = parseSse(block);
+        if (evt) handleEvent(evt.event, evt.data);
+      }
+    }
+    // flush remainder
+    if (buffer.trim()) {
+      const evt = parseSse(buffer);
+      if (evt) handleEvent(evt.event, evt.data);
+    }
+
+  } catch (err) {
+    if ($responseText) $responseText.textContent = `⚠️ 오류: ${err.message}`;
+    doneProgress();
+  } finally {
+    doneProgress();
+    if ($responseText) $responseText.classList.remove('cursor');
+    isStreaming = false;
+    document.getElementById('send-btn').disabled = false;
+    inputEl.focus();
+  }
+}
+
+// ─── SSE parsing ──────────────────────────────────────────────────────────────
+function parseSse(block) {
+  let event = 'message', dataStr = '';
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event: '))     event   = line.slice(7).trim();
+    else if (line.startsWith('data: ')) dataStr = line.slice(6).trim();
+  }
+  if (!dataStr) return null;
+  try { return { event, data: JSON.parse(dataStr) }; }
+  catch { return null; }
+}
+
+function handleEvent(event, data) {
+  switch (event) {
+    case 'start':
+      if (data.session_id) {
+        sessionId = data.session_id;
+        localStorage.setItem('monitoring_llm_sid', sessionId);
+        updateBadge();
+      }
+      break;
+
+    case 'progress':
+      addProgress(data.message, data.detail);
+      break;
+
+    case 'chunk':
+      if ($responseText) {
+        $responseText.classList.add('cursor');
+        $responseText.textContent += data.content;
+        scrollBottom();
+      }
+      break;
+
+    case 'done':
+      if ($responseText) $responseText.classList.remove('cursor');
+      doneProgress();
+      setMeta(data.intent, data.servers);
+      break;
+
+    case 'error':
+      if ($responseText) $responseText.textContent = `⚠️ ${data.message}`;
+      doneProgress();
+      break;
+  }
+}
+
+// ─── DOM builders ─────────────────────────────────────────────────────────────
+function appendUserMsg(text) {
+  const div = document.createElement('div');
+  div.className = 'msg user';
+  div.innerHTML = `
+    <div class="bubble">${esc(text)}</div>
+    <div class="msg-time">${clock()}</div>`;
+  document.getElementById('chat').appendChild(div);
+  scrollBottom();
+}
+
+function createAiMsg() {
+  const div = document.createElement('div');
+  div.className = 'msg ai';
+  div.innerHTML = `
+    <div class="bubble">
+      <div class="progress-list">
+        <div class="progress-item" id="init-step">
+          <div class="step-icon"><div class="spinner"></div></div>
+          <span class="step-text">분석 준비 중...</span>
+        </div>
+      </div>
+      <div class="response-text"></div>
+    </div>
+    <div class="msg-meta"></div>
+    <div class="msg-time">${clock()}</div>`;
+  document.getElementById('chat').appendChild(div);
+
+  $progressList = div.querySelector('.progress-list');
+  $responseText = div.querySelector('.response-text');
+  $msgMeta      = div.querySelector('.msg-meta');
+
+  scrollBottom();
+}
+
+// ─── Progress helpers ─────────────────────────────────────────────────────────
+function addProgress(msg, detail) {
+  if (!$progressList) return;
+
+  // 초기 플레이스홀더 제거
+  document.getElementById('init-step')?.remove();
+
+  // tick off previous item
+  const prev = $progressList.lastElementChild;
+  if (prev) tickDone(prev);
+
+  const item = document.createElement('div');
+  item.className = 'progress-item';
+  item.innerHTML = `
+    <div class="step-icon"><div class="spinner"></div></div>
+    <span class="step-text">${esc(msg)}${
+      detail ? `<span class="step-detail">${esc(detail)}</span>` : ''
+    }</span>`;
+  $progressList.appendChild(item);
+  scrollBottom();
+}
+
+function doneProgress() {
+  if (!$progressList) return;
+  $progressList.querySelectorAll('.spinner').forEach(el => {
+    el.outerHTML = '<span class="check-icon">✓</span>';
+  });
+}
+
+function tickDone(item) {
+  const sp = item.querySelector('.spinner');
+  if (sp) sp.outerHTML = '<span class="check-icon">✓</span>';
+}
+
+// ─── Meta ─────────────────────────────────────────────────────────────────────
+function setMeta(intent, servers) {
+  if (!$msgMeta) return;
+  if (intent && intent !== 'unknown') {
+    const b = document.createElement('span');
+    b.className = 'badge intent';
+    b.textContent = intent;
+    $msgMeta.appendChild(b);
+  }
+  (servers || []).filter(Boolean).forEach(s => {
+    const b = document.createElement('span');
+    b.className = 'badge server';
+    b.textContent = s;
+    $msgMeta.appendChild(b);
+  });
+}
+
+// ─── Util ─────────────────────────────────────────────────────────────────────
+function scrollBottom() {
+  const el = document.getElementById('chat');
+  el.scrollTop = el.scrollHeight;
+}
+
+function clock() {
+  return new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br>');
+}
+</script>
+</body>
+</html>
