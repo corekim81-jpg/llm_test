@@ -1,3 +1,4 @@
+
 """
 agent/state.py — LangGraph State 정의
 ──────────────────────────────────────
@@ -30,7 +31,8 @@ class MonitoringState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
 
     # ── 컨텍스트 (멀티턴 유지 핵심) ────────────────────────────────
-    current_servers: list[dict]   # [{hostname, ip, role, prometheus_instance, loki_host}]
+    current_servers: list[dict]   # [{hostname, ip, role, prometheus_instance, loki_host}] 아래로 변경됨. 
+                                  # [{hostname, ip, role, prometheus_job, app_job, loki_service_name, loki_server_role}] 
     last_time_range: Any          # TimeRange 객체 또는 None
     last_intent: str              # 마지막 인텐트 값
 

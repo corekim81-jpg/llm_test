@@ -83,11 +83,12 @@ def create_app() -> FastAPI:
         log.info("Monitoring LLM API 시작")
         log.info(f"  OLLAMA_MODEL    = {os.getenv('OLLAMA_MODEL',    'qwen3:8b')}")
         log.info(f"  PROMETHEUS_URL  = {os.getenv('PROMETHEUS_URL',  'http://localhost:9090')}")
-        log.info(f"  LOKI_URL        = {os.getenv('LOKI_URL',        'http://localhost:3100')}")
+        log.info(f"  LOKI_URL        = {os.getenv('LOKI_URL',        'http://localhost:3101')}")
         log.info(f"  MOCK_MODE       = {os.getenv('MOCK_MODE',       'false')}")
 
         # CMDB 초기 데이터 확인
         cmdb_path = os.getenv("CMDB_DB_PATH", "cmdb.db")
+        log.info(f"  CMDB_DB_PATH    = {os.getenv('CMDB_DB_PATH', 'cmdb.db')}")
         if not os.path.exists(cmdb_path):
             log.warning(f"CMDB 파일 없음: {cmdb_path} — seed 데이터 자동 생성")
             from monitoring_llm.cmdb.database import CMDB, seed_banksystem_16

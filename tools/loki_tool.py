@@ -1,17 +1,20 @@
 """
-tools/loki_tool.py — Loki 로그 조회 도구
-──────────────────────────────────────────────
-역할: Loki HTTP API를 통해 로그 조회 및 전처리.
-      LLM에 넘기기 전에 중복 제거, 스택트레이스 추출, 레벨별 분류.
+tools/loki_tool.py — Loki 로그 조회 도구  [수정본]
+──────────────────────────────────────────────────────
+BankSystem_16 실제 Loki 스트림 레이블:
+  Web : service_name="bank-web-httpd-logs"  / server_role="web"
+  WAS : service_name="bank-was-tomcat-logs" / server_role="was"
+  DB  : 미수집 (현재 없음)
 
-LogQL 자동 생성 규칙:
-  기본:        {host="<loki_host>"}
-  레벨 필터:   |~ "(?i)(error|warn)"
-  키워드 추가: |~ "(?i)<keyword>"
-  레이블 추가: status_code 등 structured metadata 활용
+변경 요약:
+  - loki_host(host 레이블) → service_name + server_role 레이블로 교체
+  - LogQLBuilder: {host=} → {service_name=, server_role=}
+  - LokiInput: loki_host → service_name / server_role 분리
+  - 테스트 케이스: 실제 service_name 기준으로 교체
 
 독립 실행:
     MOCK_MODE=true python -m monitoring_llm.tools.loki_tool
+    LOKI_URL=http://192.168.0.41:3100 python -m monitoring_llm.tools.loki_tool
 """
 
 import re
@@ -36,43 +39,78 @@ from monitoring_llm.tools.base import (
 )
 
 
+# ── 노드 → Loki 스트림 레이블 매핑 ──────────────────────────────
+LOKI_NODE_CONFIG = {
+    "dev-masternode": {
+        "service_name": "bank-web-httpd-logs",
+        "server_role":  "web",
+    },
+    "ONTUNETEST2": {
+        "service_name": "bank-was-tomcat-logs",
+        "server_role":  "was",
+    },
+    # DB 로그 수집 미설정 — 추후 추가 시 여기에 등록
+    # "DESKTOP-H0M89JB": {
+    #     "service_name": "bank-db-mysql-logs",
+    #     "server_role":  "db",
+    # },
+}
+
+
 # ── LogQL 빌더 ────────────────────────────────────────────────────
 class LogQLBuilder:
     """
     조건에 따라 LogQL 자동 생성.
-    Loki v3+ structured metadata 지원.
+    스트림 셀렉터: service_name + server_role (BankSystem_16 기준)
     """
-    def __init__(self, host: str, job: Optional[str] = None):
-        self.host = host
-        self.job = job
+    def __init__(
+        self,
+        service_name: str,
+        server_role: str = "",
+        extra_labels: dict = None,
+    ):
+        self.service_name = service_name
+        self.server_role  = server_role
+        self.extra_labels = extra_labels or {}
 
     def build(
         self,
-        level_filter: str = "",      # "error|warn"
-        keyword: str = "",           # "500|OOM|timeout"
-        status_code: str = "",       # HTTP 상태코드 "500"
-        trace_id: str = "",          # Jaeger TraceID 연동
-        label_filters: dict = None,  # 추가 stream 셀렉터
+        level_filter: str = "",   # "ERROR|WARN" — Apache access log엔 없음, 비워도 됨
+        keyword: str = "",        # "500|OOM|timeout"
+        status_code: str = "",    # HTTP 상태코드 "500" / "4xx" / "5xx"
+        trace_id: str = "",       # Jaeger TraceID
     ) -> str:
-        # Stream selector
-        # selectors = {'"host"': f'"{self.host}"'} # # 결과: {"host"="web01"}  ← 잘못된 LogQL
-        selectors = {"host": f'"{self.host}"'}
-        if self.job:
-            selectors['"job"'] = f'"{self.job}"'
-        if label_filters:
-            for k, v in label_filters.items():
-                selectors[f'"{k}"'] = f'"{v}"'
-        stream = "{" + ",".join(f"{k}={v}" for k, v in selectors.items()) + "}"
-        
+        # ── Stream selector ──────────────────────────────────────
+        parts = [f'service_name="{self.service_name}"']
+        if self.server_role:
+            parts.append(f'server_role="{self.server_role}"')
+        for k, v in self.extra_labels.items():
+            parts.append(f'{k}="{v}"')
+        stream = "{" + ", ".join(parts) + "}"
 
-        # Pipeline filters
+        # ── Pipeline filters ─────────────────────────────────────
         pipeline = ""
-        if level_filter:            
-            pipeline += f' |~ `(?i)({level_filter})`' # (?i) 대소문자 무시 플래그
+
+        # level 필터 — Tomcat/앱 로그에만 유효 (Apache access 로그엔 없음)
+        if level_filter:
+            pipeline += f' |~ `(?i)({level_filter})`'
+
+        # 상태코드 필터 — Apache Combined Log Format 지원
+        # 형식: "METHOD /path HTTP/1.x" STATUS SIZE
+        # 패턴: " 500 " / " 5xx " / " [45]xx "
         if status_code:
-            pipeline += f' |~ `(?:status|HTTP).*{re.escape(status_code)}|{re.escape(status_code)}.*(?:status|HTTP)`'
+            if status_code in ("4xx", "5xx", "[45]xx"):
+                prefix = status_code[0] if status_code != "[45]xx" else "[45]"
+                pipeline += f' |~ `" {prefix}\\d\\d "`'
+            else:
+                # 구체적 상태코드: 500, 404 등
+                pipeline += f' |~ `" {re.escape(status_code)} "`'
+
         if keyword:
-            pipeline += f' |~ `(?i)({re.escape(keyword)})`'
+            # | 는 regex OR 연산자 — re.escape 하면 \| 로 변환되어 깨짐
+            # 각 항목만 개별 escape 후 | 로 재결합
+            escaped_kw = "|".join(re.escape(k) for k in keyword.split("|"))
+            pipeline += f' |~ `(?i)({escaped_kw})`'
         if trace_id:
             pipeline += f' |= `{trace_id}`'
 
@@ -85,17 +123,16 @@ class LogQLBuilder:
         return self.build(status_code="500", level_filter="ERROR")
 
     def build_oom_logql(self) -> str:
-        return self.build(keyword="OutOfMemoryError|OOM|GC overhead|java.lang.OutOfMemory")        
+        return self.build(
+            keyword="OutOfMemoryError|OOM|GC overhead|java.lang.OutOfMemory"
+        )
 
 
 # ── 로그 전처리 ───────────────────────────────────────────────────
 def preprocess_logs(raw_logs: list[dict]) -> dict:
     """
     Loki raw 로그를 LLM에 넘기기 전에 전처리.
-    - 중복 제거 (동일 내용 반복 로그)
-    - 스택트레이스 추출 및 그룹핑
-    - 레벨별 집계
-    - 핵심 에러 라인 추출
+    - 중복 제거 / 스택트레이스 추출 / 레벨별 집계
     """
     level_counts: dict[str, int] = {}
     key_logs: list[dict] = []
@@ -105,39 +142,30 @@ def preprocess_logs(raw_logs: list[dict]) -> dict:
     trace_id_set: set[str] = set()
 
     STACK_LINE_RE = re.compile(r'^\s+at\s+[\w.$<>]+\(')
-    LEVEL_RE = re.compile(r'\b(ERROR|WARN|INFO|DEBUG|FATAL|TRACE)\b')
-    TRACE_ID_RE = re.compile(r'traceId[=:\s]+([0-9a-f]{16,32})', re.IGNORECASE)
+    LEVEL_RE      = re.compile(r'\b(ERROR|WARN|INFO|DEBUG|FATAL|TRACE)\b')
+    TRACE_ID_RE   = re.compile(r'traceId[=:\s]+([0-9a-f]{16,32})', re.IGNORECASE)
 
     for entry in raw_logs:
         line = entry.get("log", "")
-        t = entry.get("time", "")
+        t    = entry.get("time", "")
 
-        # 레벨 추출
-        m = LEVEL_RE.search(line)
+        m     = LEVEL_RE.search(line)
         level = m.group(1) if m else "OTHER"
-        level_counts[level] = level_counts.get(level, 0) + 1
 
-        # TraceID 추출 (Jaeger 연동용)
         tid = TRACE_ID_RE.search(line)
         if tid:
             trace_id_set.add(tid.group(1))
 
-        # 스택트레이스 감지
-        # 스택트레이스 라인이면 누적만 하고 나머지 처리 스킵
         if STACK_LINE_RE.match(line):
             current_trace.append(line.strip())
-            continue                              # ← level_counts 집계에서도 제외
-        
-        
-        # 일반 라인 진입 시 직전 스택트레이스 flush
+            continue
+
         if len(current_trace) >= 2:
-            stack_traces.append(current_trace[:8]) # 최대 8줄
+            stack_traces.append(current_trace[:8])
         current_trace = []
 
-        # 레벨 집계 (스택트레이스 라인 제외됨)
         level_counts[level] = level_counts.get(level, 0) + 1
 
-        # 중복 제거
         content_hash = hashlib.md5(
             re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}', '', line).encode()
         ).hexdigest()[:12]
@@ -145,70 +173,81 @@ def preprocess_logs(raw_logs: list[dict]) -> dict:
             continue
         seen_hashes.add(content_hash)
 
-        # 핵심 에러 로그
         if level in ("ERROR", "FATAL", "WARN"):
             key_logs.append({"time": t, "level": level, "log": line[:250]})
 
-    # ↓ 루프 종료 후 마지막 스택트레이스 flush
     if len(current_trace) >= 2:
-        stack_traces.append(current_trace[:8]) # 최대 8줄                      
+        stack_traces.append(current_trace[:8])
 
     return {
-        "total": len(raw_logs),
-        "unique": len(seen_hashes),
+        "total":        len(raw_logs),
+        "unique":       len(seen_hashes),
         "level_counts": level_counts,
-        "key_logs": key_logs[:30],
+        "key_logs":     key_logs[:30],
         "stack_traces": ["\n".join(st) for st in stack_traces[:5]],
-        "trace_ids": list(trace_id_set)[:10],
+        "trace_ids":    list(trace_id_set)[:10],
     }
 
 
 # ── Mock 데이터 ────────────────────────────────────────────────────
-def _mock_logs(host: str, keyword: str = "") -> dict:
+def _mock_logs(service_name: str, keyword: str = "") -> dict:
     sample_logs = [
         {"time": "14:32:01", "level": "ERROR",
-         "log": f"[ERROR] [{host}] java.lang.OutOfMemoryError: Java heap space"},
+         "log": f"[ERROR] [{service_name}] java.lang.OutOfMemoryError: Java heap space"},
         {"time": "14:32:01", "level": "ERROR",
          "log": "  at java.util.Arrays.copyOf(Arrays.java:3210)"},
         {"time": "14:32:01", "level": "ERROR",
          "log": "  at com.bank.service.TransactionService.process(TransactionService.java:87)"},
         {"time": "14:32:03", "level": "ERROR",
-         "log": f"[ERROR] [{host}] HTTP 500 /api/transfer - Internal Server Error"},
+         "log": f"[ERROR] [{service_name}] HTTP 500 /api/transfer - Internal Server Error"},
         {"time": "14:32:05", "level": "WARN",
-         "log": f"[WARN]  [{host}] DB connection timeout after 30000ms - retrying (2/3)"},
+         "log": f"[WARN]  [{service_name}] DB connection timeout after 30000ms - retrying (2/3)"},
         {"time": "14:32:10", "level": "ERROR",
-         "log": f"[ERROR] [{host}] AJP connection to 192.168.16.20:8009 refused"},
+         "log": f"[ERROR] [{service_name}] AJP connection to 192.168.16.20:8009 refused"},
         {"time": "14:32:15", "level": "ERROR",
-         "log": f"[ERROR] [{host}] HTTP 500 /api/balance - java.lang.NullPointerException"},
+         "log": f"[ERROR] [{service_name}] HTTP 500 /api/balance - java.lang.NullPointerException"},
         {"time": "14:32:20", "level": "WARN",
-         "log": f"[WARN]  [{host}] Slow query detected: 3241ms for SELECT * FROM transactions"},
+         "log": f"[WARN]  [{service_name}] Slow query detected: 3241ms for SELECT * FROM transactions"},
         {"time": "14:33:01", "level": "ERROR",
-         "log": f"[ERROR] [{host}] GC overhead limit exceeded"},
+         "log": f"[ERROR] [{service_name}] GC overhead limit exceeded"},
     ]
     if keyword:
         sample_logs = [
             e for e in sample_logs
             if re.search(keyword, e["log"], re.IGNORECASE)
         ]
-    preprocessed = preprocess_logs(sample_logs)
-    return preprocessed
+    return preprocess_logs(sample_logs)
 
 
 # ── Tool 입력 스키마 ───────────────────────────────────────────────
 class LokiInput(BaseModel):
-    loki_host: str   = Field(description="Loki {host} 레이블 (예: web01-bank16)")
+    service_name: str = Field(
+        description=(
+            "Loki service_name 레이블 "
+            "(예: bank-web-httpd-logs | bank-was-tomcat-logs)"
+        )
+    )
+    server_role: str = Field(
+        default="",
+        description="Loki server_role 레이블 (예: web | was)"
+    )
     start_ts: int    = Field(description="시작 Unix timestamp")
     end_ts: int      = Field(description="종료 Unix timestamp")
     level_filter: str = Field(
-        # default="ERROR|WARN|error|warn", # 정규식에서 대소문자 구분 제거 하면 됨 
         default="ERROR|WARN",
         description="로그 레벨 필터 — 대소문자 자동 무시 (예: 'ERROR|WARN|FATAL')"
     )
-    keyword: str      = Field(default="", description="추가 키워드 필터 (예: '500|OOM|timeout')")
-    status_code: str  = Field(default="", description="HTTP 상태코드 필터 (예: '500')")
-    trace_id: str     = Field(default="", description="Jaeger TraceID로 특정 요청 로그 조회")
-    limit: int        = Field(default=200, description="최대 로그 수 (기본 200, 최대 500)")
-    loki_job: str     = Field(default="", description="Loki {job} 레이블 (선택)")
+    keyword: str     = Field(default="", description="추가 키워드 필터 (예: 'OOM|timeout')")
+    status_code: str = Field(
+        default="",
+        description=(
+            "HTTP 상태코드 필터. "
+            "Apache access 로그 기준: '500'(특정), '5xx'(5xx 전체), '[45]xx'(4xx+5xx). "
+            "Tomcat 로그는 level_filter 사용 권장."
+        )
+    )
+    trace_id: str    = Field(default="", description="Jaeger TraceID로 특정 요청 로그 조회")
+    limit: int       = Field(default=200, description="최대 로그 수 (기본 200, 최대 500)")
 
 
 # ── BaseTool 구현 ──────────────────────────────────────────────────
@@ -217,24 +256,28 @@ class LokiQueryTool(BaseTool):
     description: str = (
         "서버의 로그를 Loki에서 조회하고 전처리한다. "
         "오류/경고 로그, HTTP 상태코드, 특정 키워드(OOM, timeout 등) 검색에 사용. "
-        "스택트레이스 자동 추출, Jaeger TraceID 연동 지원."
+        "스택트레이스 자동 추출, Jaeger TraceID 연동 지원. "
+        "service_name: bank-web-httpd-logs(Web) | bank-was-tomcat-logs(WAS)"
     )
     args_schema: Type[BaseModel] = LokiInput
 
     def _run(
         self,
-        loki_host: str,
-        start_ts: int,
-        end_ts: int,
+        service_name: str,
+        server_role: str = "",
+        start_ts: int = 0,
+        end_ts: int = 0,
         level_filter: str = "ERROR|WARN",
         keyword: str = "",
         status_code: str = "",
         trace_id: str = "",
         limit: int = 200,
-        loki_job: str = "",
     ) -> str:
-        limit = min(limit, 500)
-        builder = LogQLBuilder(host=loki_host, job=loki_job or None)
+        limit   = min(limit, 500)
+        builder = LogQLBuilder(
+            service_name=service_name,
+            server_role=server_role,
+        )
         logql = builder.build(
             level_filter=level_filter,
             keyword=keyword,
@@ -243,12 +286,13 @@ class LokiQueryTool(BaseTool):
         )
 
         if MOCK_MODE:
-            preprocessed = _mock_logs(loki_host, keyword or status_code)
+            preprocessed = _mock_logs(service_name, keyword or status_code)
             return ok({
-                "host": loki_host,
-                "logql": logql,
-                "mock": True,
-                "period": f"{ts_to_str(start_ts)} ~ {ts_to_str(end_ts)}",
+                "service_name": service_name,
+                "server_role":  server_role,
+                "logql":        logql,
+                "mock":         True,
+                "period":       f"{ts_to_str(start_ts)} ~ {ts_to_str(end_ts)}",
                 **preprocessed,
             })
 
@@ -266,79 +310,97 @@ class LokiQueryTool(BaseTool):
         )
 
         if not result["ok"]:
-            return err(result["error"], host=loki_host, logql=logql)
+            return err(result["error"], service_name=service_name, logql=logql)
 
         data = result["data"]
         if data.get("status") != "success":
             return err(data.get("error", "Loki 쿼리 실패"), logql=logql)
 
-        # raw 로그 파싱
         raw_logs = []
-        result_data = data.get("data", {})
-        # for stream in data["data"]["result"]:  # "data" 키 없으면 KeyError
-        for stream in result_data.get("result", []):
+        for stream in data.get("data", {}).get("result", []):
             labels = stream.get("stream", {})
-            # for ts_ns, line in stream["values"]:  # "values" 없으면 KeyError
-            for ts_ns, line in stream.get("values", []):    
+            for ts_ns, line in stream.get("values", []):
                 ts = int(ts_ns) // 10**9
                 dt = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-                raw_logs.append({
-                    "time": dt,
-                    "log": line,
-                    "labels": labels,
-                })
+                raw_logs.append({"time": dt, "log": line, "labels": labels})
 
-        # 전처리
         preprocessed = preprocess_logs(raw_logs)
 
         return ok({
-            "host": loki_host,
-            "logql": logql,
-            "period": f"{ts_to_str(start_ts)} ~ {ts_to_str(end_ts)}",
+            "service_name": service_name,
+            "server_role":  server_role,
+            "logql":        logql,
+            "period":       f"{ts_to_str(start_ts)} ~ {ts_to_str(end_ts)}",
             **preprocessed,
         })
 
-    # async def _arun(self, **kwargs) -> str:
-    #     return self._run(**kwargs)
     async def _arun(self, **kwargs) -> str:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, lambda: self._run(**kwargs)
-    )
+        return await loop.run_in_executor(None, lambda: self._run(**kwargs))
 
 
 # ── 독립 실행 테스트 ──────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, "../..")
     from monitoring_llm.nlp.time_parser import default_range
 
     print(f"{'='*55}")
     print(f"Loki Tool 테스트 — MOCK_MODE={MOCK_MODE}")
+    print(f"LOKI_URL={LOKI_URL}")
     print(f"{'='*55}")
 
-    tr = default_range(60)
+    tr   = default_range(60)
     tool = LokiQueryTool()
 
-    tests = [
-        ("web-bank16",  "", "", "500"),
-        ("was-bank16",  "", "OOM|OutOfMemory", ""),
-        ("db-bank16",   "", "slow|timeout", ""),
+    # ── 실제 BankSystem_16 로그 구조 ────────────────────────────
+    # bank-web-httpd-logs  : Apache Combined Log Format (access 로그)
+    # bank-was-tomcat-logs : Tomcat Combined Log Format (access 로그)
+    # → 둘 다 ERROR|WARN 키워드 없음 → 상태코드 필터만 유효
+    # → catalina.out(Tomcat 에러 로그) 수집 필요 시 별도 OTel filelog 설정
+    tr = default_range(60 * 24)  # 24시간
+    test_cases = [
+        {
+            "service_name": "bank-web-httpd-logs",
+            "server_role":  "web",
+            "level_filter": "",       # access 로그 — 레벨 없음
+            "keyword":      "",
+            "status_code":  "5xx",    # 5xx 에러만
+        },
+        {
+            "service_name": "bank-was-tomcat-logs",
+            "server_role":  "was",
+            "level_filter": "",       # access 로그 — 레벨 없음
+            "keyword":      "",
+            "status_code":  "5xx",    # 5xx 에러만
+        },
+        # 정상 동작 확인용 — 필터 없이 전체 로그
+        {
+            "service_name": "bank-web-httpd-logs",
+            "server_role":  "web",
+            "level_filter": "",
+            "keyword":      "",
+            "status_code":  "",       # 필터 없음 → 전체 access 로그
+        },
     ]
 
-    for host, level, kw, sc in tests:
-        print(f"\n[{host}] level='{level}' keyword='{kw}' status='{sc}'")
+    for tc in test_cases:
+        sn = tc["service_name"]
+        print(f"\n[{sn}] role={tc['server_role']}")
 
-        builder = LogQLBuilder(host=host)
-        print(f"  LogQL: {builder.build(level_filter=level, keyword=kw, status_code=sc)}")
+        # LogQL 미리보기
+        builder = LogQLBuilder(
+            service_name=sn,
+            server_role=tc["server_role"],
+        )
+        print(f"  LogQL: {builder.build(level_filter=tc['level_filter'], keyword=tc['keyword'], status_code=tc['status_code'])}")
 
         result = tool._run(
-            loki_host=host,
+            service_name=sn,
+            server_role=tc["server_role"],
             start_ts=tr.start_ts,
             end_ts=tr.end_ts,
-            level_filter=level or "ERROR|WARN|error|warn",
-            keyword=kw,
-            status_code=sc,
+            level_filter=tc["level_filter"],
+            keyword=tc["keyword"],
+            status_code=tc["status_code"],
         )
         data = json.loads(result)
         if data.get("ok"):
@@ -348,7 +410,7 @@ if __name__ == "__main__":
                 print(f"  스택트레이스 {len(data['stack_traces'])}개 추출됨")
             if data.get("trace_ids"):
                 print(f"  TraceID 발견: {data['trace_ids'][:3]}")
-            for entry in data.get("key_logs", [])[:2]:
+            for entry in data.get("key_logs", [])[:3]:
                 print(f"    [{entry['time']}] {entry['log'][:80]}")
         else:
             print(f"  ERROR: {data.get('error')}")

@@ -7,13 +7,24 @@ nlp/intent_classifier.py — 인텐트 분류기 (룰 우선 + LLM fallback)
   - think 모드 비활성화 (Qwen3 /no_think 태그)
   - 분류 근거(reason) 반환
   - confidence 임계값 기반 재시도 로직
-  
+
 More 개선:
 개선 사항:
   1. 룰 우선순위 충돌 수정 — ERROR_ANALYSIS를 ACTION_RECOMMEND보다 앞에 배치
   2. _ask_action 조건 강화 — 에러/원인 키워드와 함께 올 때는 ERROR_ANALYSIS 우선
   3. ChatOllama 인스턴스 재사용 — IntentClassifier.__init__ 에서 한 번만 생성
-  4. confidence 임계값 기반 재시도 로직 구현 — 룰 conf < threshold 시 LLM 재확인  
+  4. confidence 임계값 기반 재시도 로직 구현 — 룰 conf < threshold 시 LLM 재확인
+
+
+변경 요약:
+  - _has_role() 추가 — 숫자 없는 역할명 (web, was, db) 매칭
+  - _ask_info() — "알려줘", "뭐야" 패턴 추가
+  - ASSET_INFO 룰 — _has_host OR _has_role 로 확장
+    "web 서버 정보 알려줘", "was 서버 정보 알려줘" 매칭
+  - LLM format="json" 제거 — Qwen3 /no_think 와 충돌해 빈 응답 유발
+  - LLM 응답 파싱 강화 — think 태그 제거 후 JSON 추출
+  - TEST_CASES에 숫자 없는 role 질문 추가
+
 """
 
 import json
@@ -24,7 +35,7 @@ from enum import Enum
 from typing import Optional
 
 log = logging.getLogger("monitoring_llm.nlp")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "qwen3:8b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # [개선 4] confidence 임계값 — 룰 결과가 이 값 미만이면 LLM 재확인
@@ -33,44 +44,122 @@ CONFIDENCE_THRESHOLD = 0.85
 
 class QueryIntent(str, Enum):
     INCIDENT_HISTORY = "incident_history"
-    ASSET_INFO       = "asset_info"
-    METRIC_RANGE     = "metric_range"
-    MULTI_MODAL      = "multi_modal"
-    ERROR_ANALYSIS   = "error_analysis"
+    ASSET_INFO = "asset_info"
+    METRIC_RANGE = "metric_range"
+    MULTI_MODAL = "multi_modal"
+    ERROR_ANALYSIS = "error_analysis"
     ACTION_RECOMMEND = "action_recommend"
-    UNKNOWN          = "unknown"
+    UNKNOWN = "unknown"
 
 
 class ClassifyResult:
-    def __init__(self, intent: QueryIntent, confidence: float,
-                 reason: str, method: str):
-        self.intent     = intent
+    def __init__(
+        self, intent: QueryIntent, confidence: float, reason: str, method: str
+    ):
+        self.intent = intent
         self.confidence = confidence
-        self.reason     = reason
-        self.method     = method
+        self.reason = reason
+        self.method = method
 
     def __repr__(self):
-        return (f"ClassifyResult(intent={self.intent.value}, "
-                f"conf={self.confidence:.2f}, method={self.method})")
+        return (
+            f"ClassifyResult(intent={self.intent.value}, "
+            f"conf={self.confidence:.2f}, method={self.method})"
+        )
 
 
 # ── 룰 헬퍼 ────────────────────────────────────────────────────────
-#대소문자 구분이 필요하면 t, 필요 없으면 tl을 사용하는 구조입니다.
-_IP_RE       = re.compile(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b')
-_HTTP_ERR_RE = re.compile(r'\b[45]\d{2}\b')
-_HOST_RE     = re.compile(r'\b(?:web|was|db|app|proxy|lb)\d+(?:[-_][\w]+)?\b', re.IGNORECASE)
+# 대소문자 구분이 필요하면 t, 필요 없으면 tl을 사용하는 구조입니다.
+_IP_RE = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
+_HTTP_ERR_RE = re.compile(r"\b[45]\d{2}\b")
+_HOST_RE = re.compile(
+    r"\b(?:web|was|db|app|proxy|lb)\d+(?:[-_][\w]+)?\b", re.IGNORECASE
+)
+_ROLE_RE = re.compile(
+    r"\b(web|was|db)\s*서버\b", re.IGNORECASE
+)  # ← 추가: "web 서버", "was 서버"
 
-def _has_ip(t, _):       return bool(_IP_RE.search(t))
-def _has_err(t, _):      return bool(_HTTP_ERR_RE.search(t))
-def _has_host(t, _):     return bool(_HOST_RE.search(t))
-def _has_metric(_, tl):  return bool(re.search(r'메트릭|cpu|메모리|heap|성능|지표|disk|tps|qps|스레드|thread|연결\s*수', tl))
-def _has_log(_, tl):     return bool(re.search(r'로그|log\b', tl))
-def _has_past(_, tl):    return bool(re.search(r'어제|지난\s*주|그제|이틀\s*전|\d+일\s*전|최근', tl))
-def _has_trouble(_, tl): return bool(re.search(r'문제|장애|이슈|이상|오류|에러|알람|알림|다운', tl))
-def _has_err_kw(_, tl):  return bool(re.search(r'oom|outofmemory|timeout|타임아웃|slow.?query|슬로우|deadlock|교착|disk.?full|ajp|npe|gc.?overhead', tl))
-def _ask_why(_, tl):     return bool(re.search(r'머지|원인|왜|이유|뭐야|뭔지|뭔데|분석|발생', tl))
-def _ask_action(_, tl):  return bool(re.search(r'조치|해결|어떻게\s*해|뭘\s*해야|방법|대응|복구|해야\s*할|할\s*것', tl))
-def _ask_info(_, tl):    return bool(re.search(r'뭐하|정보|역할|어떤\s*서버|누가|담당|뭔지|소속', tl))
+
+def _has_ip(t, _):
+    return bool(_IP_RE.search(t))
+
+
+def _has_err(t, _):
+    return bool(_HTTP_ERR_RE.search(t))
+
+
+def _has_host(t, _):
+    return bool(_HOST_RE.search(t))
+
+
+def _has_role(_, tl):
+    return bool(_ROLE_RE.search(tl))  # ← 추가
+
+
+# def _has_metric(_, tl):
+#     return bool(
+#         re.search(
+#             # r"메트릭|cpu|메모리|heap|성능|지표|disk|tps|qps|스레드|thread|연결\s*수", tl
+#             r"메트릭|cpu|메모리|heap|성능|지표|disk|디스크|tps|qps|스레드|thread|연결\s*수|사용률|사용량|상태",
+#             tl,
+#         )
+#     )
+def _has_metric(_, tl): return bool(re.search(
+    r'메트릭|cpu|메모리|heap|성능|지표|disk|디스크|tps|qps'
+    r'|스레드|thread|연결\s*수|사용률|사용량|상태'
+    r'|요청|request|응답\s*시간|처리량|트래픽',  # ← 추가
+    tl))
+
+def _has_log(_, tl):
+    return bool(re.search(r"로그|log\b", tl))
+
+
+def _has_past(_, tl):
+    return bool(re.search(r"어제|지난\s*주|그제|이틀\s*전|\d+일\s*전|최근", tl))
+
+
+def _has_trouble(_, tl):
+    return bool(re.search(r"문제|장애|이슈|이상|오류|에러|알람|알림|다운", tl))
+
+
+# def _has_err_kw(_, tl):
+#     return bool(
+#         re.search(
+#             r"oom|outofmemory|timeout|타임아웃|slow.?query|슬로우|deadlock|교착|disk.?full|ajp|npe|gc.?overhead",
+#             tl,
+#         )
+#     )
+def _has_err_kw(_, tl):
+    return bool(
+        re.search(
+            r"oom|outofmemory|timeout|타임아웃|slow.?query|슬로우|deadlock|교착"
+            r"|disk.?full|ajp|npe|gc.?overhead"
+            r"|느린|느려|지연|늦어|응답\s*시간",  # ← 추가
+            tl,
+        )
+    )
+
+
+def _ask_why(_, tl):
+    return bool(re.search(r"머지|원인|왜|이유|뭐야|뭔지|뭔데|분석|발생", tl))
+
+
+def _ask_action(_, tl):
+    return bool(
+        re.search(
+            r"조치|해결|어떻게\s*해|뭘\s*해야|방법|대응|복구|해야\s*할|할\s*것", tl
+        )
+    )
+
+
+# def _ask_info(_, tl):    return bool(re.search(r'뭐하|정보|역할|어떤\s*서버|누가|담당|뭔지|소속', tl))
+def _ask_info(_, tl):
+    return bool(
+        re.search(
+            r"뭐하|정보|역할|어떤\s*서버|누가|담당|뭔지|소속|알려줘|뭐야|어떤\s*역할",
+            tl,  # ← 알려줘, 뭐야 추가
+        )
+    )
 
 
 # ── [개선 1, 2] 룰 우선순위 재조정 ─────────────────────────────────
@@ -79,71 +168,141 @@ def _ask_info(_, tl):    return bool(re.search(r'뭐하|정보|역할|어떤\s*�
 #   - 에러/원인 키워드가 함께 있으면 ERROR_ANALYSIS 를 먼저 판단
 #   - 에러/원인 없이 순수 조치 요청일 때만 ACTION_RECOMMEND
 
-RULES = [    
+RULES = [
+    # ← 여기에 추가 (기존 첫 번째 룰보다 앞에)
+    # HTTP 에러코드 + 존재 질문 → error_analysis (Loki 로그 조회)
+    (
+        lambda t, tl: _has_err(t, tl)
+        and re.search(r"있었어|있어|발생|나왔어|떴어|확인", tl),
+        QueryIntent.ERROR_ANALYSIS,
+        0.93,
+        "에러코드 + 존재 질문",
+    ),
     # [개선 2] 에러+원인+조치가 동시에 있으면 ERROR_ANALYSIS 우선
     # "OOM 해결 방법 알려줘", "500 에러 원인이랑 조치 방법"
-    (lambda t, tl: (_has_err(t, tl) or _has_err_kw(t, tl)) and _ask_why(t, tl),
-     QueryIntent.ERROR_ANALYSIS, 0.95, "에러 + 원인 질문"),    
-    
-    
-    # (lambda t,tl: _ask_action(t,tl),    
-    #  QueryIntent.ACTION_RECOMMEND, 0.95, "조치/해결/방법 키워드"),    
+    # 에러 + 원인 질문 → ERROR_ANALYSIS 최우선
+    (
+        lambda t, tl: (_has_err(t, tl) or _has_err_kw(t, tl)) and _ask_why(t, tl),
+        QueryIntent.ERROR_ANALYSIS,
+        0.95,
+        "에러 + 원인 질문",
+    ),
+    # (lambda t,tl: _ask_action(t,tl),
+    #  QueryIntent.ACTION_RECOMMEND, 0.95, "조치/해결/방법 키워드"),
     # [개선 2] 순수 조치 요청 (에러/원인 키워드 없음)
-    (lambda t, tl: _ask_action(t, tl) and not (_has_err(t, tl) or _has_err_kw(t, tl)) and not _ask_why(t, tl),
-     QueryIntent.ACTION_RECOMMEND, 0.95, "순수 조치/해결/방법 요청"),
-    
-    
+    # 순수 조치 요청 (에러/원인 없음)
+    (
+        lambda t, tl: _ask_action(t, tl)
+        and not (_has_err(t, tl) or _has_err_kw(t, tl))
+        and not _ask_why(t, tl),
+        QueryIntent.ACTION_RECOMMEND,
+        0.95,
+        "순수 조치/해결/방법 요청",
+    ),
+    # 전체 서버 상태 점검 → multi_modal
+    (
+        lambda t, tl: re.search(r"전체|모든|BankSystem", tl)
+        and re.search(r"점검|상태|확인", tl),
+        QueryIntent.MULTI_MODAL,
+        0.90,
+        "전체 서버 점검",
+    ),
     # (lambda t,tl: (_has_err(t,tl) or _has_err_kw(t,tl)) and _ask_why(t,tl),
     #  QueryIntent.ERROR_ANALYSIS, 0.95, "에러 + 원인 질문"),
     # [개선 2] 에러+조치 (원인 질문 없음) → ACTION_RECOMMEND
     # "OOM 해결 방법 알려줘" (왜? 없음)
-    (lambda t, tl: (_has_err(t, tl) or _has_err_kw(t, tl)) and _ask_action(t, tl) and not _ask_why(t, tl),
-     QueryIntent.ACTION_RECOMMEND, 0.90, "에러 + 조치 요청"),
-    
-    (lambda t, tl: _has_ip(t, tl) and _ask_info(t, tl),
-     QueryIntent.ASSET_INFO, 0.98, "IP + 정보 요청"),
-
-    (lambda t, tl: _has_host(t, tl) and _ask_info(t, tl) and not _has_metric(t, tl),
-     QueryIntent.ASSET_INFO, 0.90, "hostname + 정보 요청"),
-
-    (lambda t, tl: _has_metric(t, tl) and _has_log(t, tl),
-     QueryIntent.MULTI_MODAL, 0.92, "메트릭 + 로그 동시 요청"),
-
-    (lambda t, tl: re.search(r'같이|함께|모두|전체\s*확인|통합|종합', tl) and _has_trouble(t, tl),
-     QueryIntent.MULTI_MODAL, 0.85, "복합 조회 패턴"),
-
-    (lambda t, tl: _has_metric(t, tl) and not _has_log(t, tl),
-     QueryIntent.METRIC_RANGE, 0.88, "메트릭 조회"),
-
+    # 에러 + 조치 (원인 없음) → ACTION_RECOMMEND
+    (
+        lambda t, tl: (_has_err(t, tl) or _has_err_kw(t, tl))
+        and _ask_action(t, tl)
+        and not _ask_why(t, tl),
+        QueryIntent.ACTION_RECOMMEND,
+        0.90,
+        "에러 + 조치 요청",
+    ),
+    # IP + 정보 요청
+    (
+        lambda t, tl: _has_ip(t, tl) and _ask_info(t, tl),
+        QueryIntent.ASSET_INFO,
+        0.98,
+        "IP + 정보 요청",
+    ),
+    # (lambda t, tl: _has_host(t, tl) and _ask_info(t, tl) and not _has_metric(t, tl),
+    #  QueryIntent.ASSET_INFO, 0.90, "hostname + 정보 요청"),
+    # hostname(번호 있음) 또는 role(번호 없음) + 정보 요청  ← 수정
+    (
+        lambda t, tl: (_has_host(t, tl) or _has_role(t, tl))
+        and _ask_info(t, tl)
+        and not _has_metric(t, tl),
+        QueryIntent.ASSET_INFO,
+        0.90,
+        "hostname/role + 정보 요청",
+    ),
+    # 메트릭 + 로그 동시 → MULTI_MODAL
+    (
+        lambda t, tl: _has_metric(t, tl) and _has_log(t, tl),
+        QueryIntent.MULTI_MODAL,
+        0.92,
+        "메트릭 + 로그 동시 요청",
+    ),
+    # 복합 조회 패턴
+    (
+        lambda t, tl: re.search(r"같이|함께|모두|전체\s*확인|통합|종합", tl)
+        and _has_trouble(t, tl),
+        QueryIntent.MULTI_MODAL,
+        0.85,
+        "복합 조회 패턴",
+    ),
+    # 메트릭만
+    (
+        lambda t, tl: _has_metric(t, tl) and not _has_log(t, tl),
+        QueryIntent.METRIC_RANGE,
+        0.88,
+        "메트릭 조회",
+    ),
     # [개선 1] "어제 OOM 왜 발생했어?" 는 ERROR_ANALYSIS(위)에서 먼저 잡힘
     # 과거 시간 + 문제 (에러 원인 질문 아님)
-    (lambda t, tl: _has_past(t, tl) and _has_trouble(t, tl) and not _ask_why(t, tl),
-     QueryIntent.INCIDENT_HISTORY, 0.92, "과거 시간 + 문제/장애"),
-
-    (lambda t, tl: _has_log(t, tl) and not _has_metric(t, tl),
-     QueryIntent.MULTI_MODAL, 0.82, "로그 단독 조회 → multi_modal"),
-    
-    (lambda t, tl: _has_trouble(t, tl) and not _has_metric(t, tl)
-                   and not _has_log(t, tl) and not _ask_why(t, tl),
-                       
-    # (lambda t,tl: _has_ip(t,tl) and _ask_info(t,tl),
-    #  QueryIntent.ASSET_INFO, 0.98, "IP + 정보 요청"),
-    # (lambda t,tl: _has_host(t,tl) and _ask_info(t,tl) and not _has_metric(t,tl),
-    #  QueryIntent.ASSET_INFO, 0.90, "hostname + 정보 요청"),    
-    # (lambda t,tl: _has_metric(t,tl) and _has_log(t,tl),
-    #  QueryIntent.MULTI_MODAL, 0.92, "메트릭 + 로그 동시 요청"),
-    # (lambda t,tl: re.search(r'같이|함께|모두|전체\s*확인|통합|종합', tl) and _has_trouble(t,tl),
-    #  QueryIntent.MULTI_MODAL, 0.85, "복합 조회 패턴"),
-    # (lambda t,tl: _has_metric(t,tl) and not _has_log(t,tl),
-    #  QueryIntent.METRIC_RANGE, 0.88, "메트릭 조회"),
-    # (lambda t,tl: _has_past(t,tl) and _has_trouble(t,tl),
-    #  QueryIntent.INCIDENT_HISTORY, 0.92, "과거 시간 + 문제/장애"),
-    # # 로그 단독 조회: '로그 보여줘', '로그 확인해줘'
-    # (lambda t,tl: _has_log(t,tl) and not _has_metric(t,tl),
-    #  QueryIntent.MULTI_MODAL, 0.82, '로그 단독 조회 → multi_modal'),
-    # (lambda t,tl: _has_trouble(t,tl) and not _has_metric(t,tl)
-    #               and not _has_log(t,tl) and not _ask_why(t,tl),
-     QueryIntent.INCIDENT_HISTORY, 0.80, "문제 이력 조회"),
+    # 과거 시간 + 문제 (원인 질문 아님)
+    (
+        lambda t, tl: _has_past(t, tl) and _has_trouble(t, tl) and not _ask_why(t, tl),
+        QueryIntent.INCIDENT_HISTORY,
+        0.92,
+        "과거 시간 + 문제/장애",
+    ),
+    # 로그 단독
+    (
+        lambda t, tl: _has_log(t, tl) and not _has_metric(t, tl),
+        QueryIntent.MULTI_MODAL,
+        0.82,
+        "로그 단독 조회 → multi_modal",
+    ),
+    # 문제 이력 조회
+    (
+        lambda t, tl: _has_trouble(t, tl)
+        and not _has_metric(t, tl)
+        and not _has_log(t, tl)
+        and not _ask_why(t, tl),
+        # (lambda t,tl: _has_ip(t,tl) and _ask_info(t,tl),
+        #  QueryIntent.ASSET_INFO, 0.98, "IP + 정보 요청"),
+        # (lambda t,tl: _has_host(t,tl) and _ask_info(t,tl) and not _has_metric(t,tl),
+        #  QueryIntent.ASSET_INFO, 0.90, "hostname + 정보 요청"),
+        # (lambda t,tl: _has_metric(t,tl) and _has_log(t,tl),
+        #  QueryIntent.MULTI_MODAL, 0.92, "메트릭 + 로그 동시 요청"),
+        # (lambda t,tl: re.search(r'같이|함께|모두|전체\s*확인|통합|종합', tl) and _has_trouble(t,tl),
+        #  QueryIntent.MULTI_MODAL, 0.85, "복합 조회 패턴"),
+        # (lambda t,tl: _has_metric(t,tl) and not _has_log(t,tl),
+        #  QueryIntent.METRIC_RANGE, 0.88, "메트릭 조회"),
+        # (lambda t,tl: _has_past(t,tl) and _has_trouble(t,tl),
+        #  QueryIntent.INCIDENT_HISTORY, 0.92, "과거 시간 + 문제/장애"),
+        # # 로그 단독 조회: '로그 보여줘', '로그 확인해줘'
+        # (lambda t,tl: _has_log(t,tl) and not _has_metric(t,tl),
+        #  QueryIntent.MULTI_MODAL, 0.82, '로그 단독 조회 → multi_modal'),
+        # (lambda t,tl: _has_trouble(t,tl) and not _has_metric(t,tl)
+        #               and not _has_log(t,tl) and not _ask_why(t,tl),
+        QueryIntent.INCIDENT_HISTORY,
+        0.80,
+        "문제 이력 조회",
+    ),
 ]
 
 
@@ -159,7 +318,7 @@ def rule_classify(text: str) -> Optional[ClassifyResult]:
 
 
 # ── LLM Few-shot 프롬프트 ─────────────────────────────────────────
-# 두 질문 추가함. 
+# 두 질문 추가함.
 # Q: OOM 해결 방법 알려줘
 # A: {"intent":"action_recommend","confidence":0.93,"reason":"OOM+해결방법"}
 # Q: 어제 OOM 왜 발생했어?
@@ -171,6 +330,12 @@ A: {"intent":"incident_history","confidence":0.98,"reason":"어제+문제"}
 
 Q: 192.168.16.10 서버는 뭐하는 서버야?
 A: {"intent":"asset_info","confidence":0.99,"reason":"IP+정보요청"}
+
+Q: web 서버 정보 알려줘
+A: {"intent":"asset_info","confidence":0.97,"reason":"role+정보요청"}
+
+Q: was 서버 정보 알려줘
+A: {"intent":"asset_info","confidence":0.97,"reason":"role+정보요청"}
 
 Q: 5월 6일 14시~16시 was01 메트릭 조회해줘
 A: {"intent":"metric_range","confidence":0.97,"reason":"시간범위+메트릭"}
@@ -194,13 +359,22 @@ Q: 어제 OOM 왜 발생했어?
 A: {"intent":"error_analysis","confidence":0.96,"reason":"과거+OOM+원인질문"}
 """
 
+# SYSTEM_PROMPT = f"""/no_think
+# IT 운영 모니터링 쿼리 분류기. JSON만 출력.
+
+# 인텐트: incident_history | asset_info | metric_range | multi_modal | error_analysis | action_recommend | unknown
+
+# 예시:{FEW_SHOT}
+# 출력: {{"intent":"<값>","confidence":0.0~1.0,"reason":"<한줄>"}}"""
+
+
 SYSTEM_PROMPT = f"""/no_think
-IT 운영 모니터링 쿼리 분류기. JSON만 출력.
+IT 운영 모니터링 쿼리 분류기. JSON만 출력. 마크다운 없이.
 
 인텐트: incident_history | asset_info | metric_range | multi_modal | error_analysis | action_recommend | unknown
 
 예시:{FEW_SHOT}
-출력: {{"intent":"<값>","confidence":0.0~1.0,"reason":"<한줄>"}}"""
+출력형식(JSON만): {{"intent":"<값>","confidence":0.0~1.0,"reason":"<한줄>"}}"""
 
 
 # ── [개선 3] LLM 인스턴스를 함수 내부가 아닌 클래스에서 관리 ──────
@@ -208,21 +382,23 @@ def _build_llm(model: str, base_url: str):
     """ChatOllama 인스턴스 생성. 실패 시 None 반환."""
     try:
         from langchain_ollama import ChatOllama
+
         return ChatOllama(
             model=model,
             base_url=base_url,
             temperature=0.0,
-            num_predict=120,
-            format="json",
+            num_predict=512,  # ← 150 → 512 (think 블록 포함 여유있게)
+            num_ctx=2048,  # ← 추가 (컨텍스트 제한으로 빠른 응답)
+            extra_body={"think": False},  # ← Ollama Qwen3 thinking 비활성화
+            # format="json" 제거 — Qwen3 /no_think 와 충돌해 빈 응답 유발
         )
     except Exception as e:
         log.warning(f"[ChatOllama 초기화 실패] {e}")
         return None
 
 
-
 # def llm_classify(text: str, context: str = "") -> ClassifyResult:
-def llm_classify(text: str, context: str = "", llm=None) -> ClassifyResult:    
+def llm_classify(text: str, context: str = "", llm=None) -> ClassifyResult:
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -234,26 +410,42 @@ def llm_classify(text: str, context: str = "", llm=None) -> ClassifyResult:
         _llm = llm or _build_llm(OLLAMA_MODEL, OLLAMA_BASE_URL)
         if _llm is None:
             raise RuntimeError("ChatOllama 인스턴스 없음")
-        
+
         msg = f"[이전 대화]\n{context}\n\n[질문]\n{text}" if context else text
-        
+
         # resp = llm.invoke([SystemMessage(content=SYSTEM_PROMPT),
-        #                    HumanMessage(content=msg)])        
-        resp = _llm.invoke([
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=msg),
-        ])
-        
+        #                    HumanMessage(content=msg)])
+        resp = _llm.invoke(
+            [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=msg),
+            ]
+        )
+
         raw = resp.content.strip()
+        log.debug(f"[LLM raw] {raw[:100]}")  # ← 임시 추가
+
+        # Qwen3 think 태그 제거
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+
+        # if "```" in raw:
+        #     raw = re.search(r'\{.*\}', raw, re.DOTALL).group()
+
+        # 마크다운 코드블록 제거
         if "```" in raw:
-            raw = re.search(r'\{.*\}', raw, re.DOTALL).group()
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            raw = m.group() if m else raw
+
+        # JSON 추출 (앞뒤 텍스트가 있을 경우)
+        m = re.search(r"\{[^{}]+\}", raw)
+        if m:
+            raw = m.group()
+
         data = json.loads(raw)
         intent = QueryIntent(data.get("intent", "unknown"))
-        
-        
-        
+
         # return ClassifyResult(intent, float(data.get("confidence", 0.7)),
-        #                       data.get("reason", "LLM"), "llm")        
+        #                       data.get("reason", "LLM"), "llm")
         return ClassifyResult(
             intent,
             float(data.get("confidence", 0.7)),
@@ -279,10 +471,16 @@ def llm_classify(text: str, context: str = "", llm=None) -> ClassifyResult:
 #             return llm_classify(text, context)
 #         return ClassifyResult(QueryIntent.UNKNOWN, 0.0, "룰 미매칭", "fallback")
 
+
 class IntentClassifier:
-    def __init__(self, model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL,
-                 use_llm=True, confidence_threshold=CONFIDENCE_THRESHOLD):
-        self.use_llm   = use_llm
+    def __init__(
+        self,
+        model=OLLAMA_MODEL,
+        base_url=OLLAMA_BASE_URL,
+        use_llm=True,
+        confidence_threshold=CONFIDENCE_THRESHOLD,
+    ):
+        self.use_llm = use_llm
         self.threshold = confidence_threshold
         # [개선 3] LLM 인스턴스를 생성자에서 한 번만 생성해 재사용
         self._llm = _build_llm(model, base_url) if use_llm else None
@@ -308,28 +506,56 @@ class IntentClassifier:
 
 
 # ── 테스트 케이스 ──────────────────────────────────────────────────
+# TEST_CASES = [
+#     ("어제 어떤 서버에 문제가 있었어?",           "incident_history"),
+#     ("지난주에 장애 있었어?",                    "incident_history"),
+#     ("최근 이슈 알려줘",                         "incident_history"),
+#     ("192.168.16.10 서버는 뭐하는 서버야?",       "asset_info"),
+#     ("web01 서버 정보 알려줘",                   "asset_info"),
+#     ("was01-bank16 어떤 서버야?",               "asset_info"),
+#     ("5월 6일 14시~16시 web01 메트릭 조회해줘",   "metric_range"),
+#     ("어제 was01 CPU 어떻게 됐어?",              "metric_range"),
+#     ("db01 연결 수 추이 보여줘",                  "metric_range"),
+#     ("문제있는 서버 메트릭이랑 로그 같이 보여줘",  "multi_modal"),
+#     ("was01 성능과 에러 로그 함께 확인해줘",       "multi_modal"),
+#     ("500 에러가 머지?",                         "error_analysis"),
+#     ("OOM 왜 발생해?",                           "error_analysis"),
+#     ("slow query 원인이 뭐야?",                  "error_analysis"),
+#     # [개선 1] 과거+에러+원인 → ERROR_ANALYSIS (기존엔 INCIDENT_HISTORY 오분류 가능)
+#     ("어제 OOM 왜 발생했어?",                    "error_analysis"),
+#     ("이 상황에서 어떤 조치를 취해야 해?",         "action_recommend"),
+#     ("해결 방법 알려줘",                          "action_recommend"),
+#     ("어떻게 해야 해?",                           "action_recommend"),
+#     # [개선 2] 에러+조치 (원인 없음) → ACTION_RECOMMEND
+#     ("OOM 해결 방법 알려줘",                      "action_recommend"),
+# ]
+
 TEST_CASES = [
-    ("어제 어떤 서버에 문제가 있었어?",           "incident_history"),
-    ("지난주에 장애 있었어?",                    "incident_history"),
-    ("최근 이슈 알려줘",                         "incident_history"),
-    ("192.168.16.10 서버는 뭐하는 서버야?",       "asset_info"),
-    ("web01 서버 정보 알려줘",                   "asset_info"),
-    ("was01-bank16 어떤 서버야?",               "asset_info"),
-    ("5월 6일 14시~16시 web01 메트릭 조회해줘",   "metric_range"),
-    ("어제 was01 CPU 어떻게 됐어?",              "metric_range"),
-    ("db01 연결 수 추이 보여줘",                  "metric_range"),
-    ("문제있는 서버 메트릭이랑 로그 같이 보여줘",  "multi_modal"),
-    ("was01 성능과 에러 로그 함께 확인해줘",       "multi_modal"),
-    ("500 에러가 머지?",                         "error_analysis"),
-    ("OOM 왜 발생해?",                           "error_analysis"),
-    ("slow query 원인이 뭐야?",                  "error_analysis"),
-    # [개선 1] 과거+에러+원인 → ERROR_ANALYSIS (기존엔 INCIDENT_HISTORY 오분류 가능)
-    ("어제 OOM 왜 발생했어?",                    "error_analysis"),
-    ("이 상황에서 어떤 조치를 취해야 해?",         "action_recommend"),
-    ("해결 방법 알려줘",                          "action_recommend"),
-    ("어떻게 해야 해?",                           "action_recommend"),
-    # [개선 2] 에러+조치 (원인 없음) → ACTION_RECOMMEND
-    ("OOM 해결 방법 알려줘",                      "action_recommend"),
+    ("어제 어떤 서버에 문제가 있었어?", "incident_history"),
+    ("지난주에 장애 있었어?", "incident_history"),
+    ("최근 이슈 알려줘", "incident_history"),
+    ("192.168.16.10 서버는 뭐하는 서버야?", "asset_info"),
+    ("web01 서버 정보 알려줘", "asset_info"),
+    ("was01-bank16 어떤 서버야?", "asset_info"),
+    ("web 서버 정보 알려줘", "asset_info"),  # ← 추가
+    ("was 서버 정보 알려줘", "asset_info"),  # ← 추가
+    ("db 서버 담당팀이 어디야?", "asset_info"),  # ← 추가
+    ("192.168.0.63 서버는 뭐하는 서버야?", "asset_info"),  # ← 추가
+    ("5월 6일 14시~16시 web01 메트릭 조회해줘", "metric_range"),
+    ("어제 was01 CPU 어떻게 됐어?", "metric_range"),
+    ("db01 연결 수 추이 보여줘", "metric_range"),
+    ("지금 WAS 서버 CPU랑 힙 메모리 상태 어때?", "metric_range"),  # ← 추가
+    ("문제있는 서버 메트릭이랑 로그 같이 보여줘", "multi_modal"),
+    ("was01 성능과 에러 로그 함께 확인해줘", "multi_modal"),
+    ("500 에러가 머지?", "error_analysis"),
+    ("OOM 왜 발생해?", "error_analysis"),
+    ("slow query 원인이 뭐야?", "error_analysis"),
+    ("어제 OOM 왜 발생했어?", "error_analysis"),
+    ("어제 was에서 500 에러가 왜 발생했어?", "error_analysis"),  # ← 추가
+    ("이 상황에서 어떤 조치를 취해야 해?", "action_recommend"),
+    ("해결 방법 알려줘", "action_recommend"),
+    ("OOM 해결 방법 알려줘", "action_recommend"),
+    ("web 서버 디스크가 꽉 찼는데 어떻게 해야 해?", "action_recommend"),  # ← 추가
 ]
 
 
@@ -342,14 +568,17 @@ if __name__ == "__main__":
     for text, expected in TEST_CASES:
         result = clf.classify(text)
         correct = result.intent.value == expected
-        if correct: ok_count += 1
+        if correct:
+            ok_count += 1
         by_intent.setdefault(expected, []).append(correct)
         icon = "✓" if correct else "✗"
         print(f"{icon} [{result.method:<8} {result.confidence:.2f}] {text[:50]}")
         if not correct:
             # print(f"    예상={expected}, 실제={result.intent.value}")
-            print(f"    예상={expected}, 실제={result.intent.value}, 이유={result.reason}")
-    total = len(TEST_CASES)    
+            print(
+                f"    예상={expected}, 실제={result.intent.value}, 이유={result.reason}"
+            )
+    total = len(TEST_CASES)
     print(f"\n전체: {ok_count}/{total} ({ok_count / total * 100:.1f}%)")
     print("\n인텐트별:")
     for intent, results in sorted(by_intent.items()):

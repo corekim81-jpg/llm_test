@@ -17,10 +17,10 @@ from datetime import datetime
 log = logging.getLogger("monitoring_llm.tools")
 
 # ── 환경변수 설정 ──────────────────────────────────────────────────
-PROMETHEUS_URL    = os.getenv("PROMETHEUS_URL",    "http://localhost:9090")
-LOKI_URL          = os.getenv("LOKI_URL",          "http://localhost:3100")
-JAEGER_URL        = os.getenv("JAEGER_URL",        "http://localhost:16686")
-ALERTMANAGER_URL  = os.getenv("ALERTMANAGER_URL",  "http://localhost:9093")
+PROMETHEUS_URL    = os.getenv("PROMETHEUS_URL",    "http://192.168.0.41:9092")
+LOKI_URL          = os.getenv("LOKI_URL",          "http://192.168.0.41:3101")
+JAEGER_URL        = os.getenv("JAEGER_URL",        "")
+ALERTMANAGER_URL  = os.getenv("ALERTMANAGER_URL",  "")
 CMDB_DB_PATH      = os.getenv("CMDB_DB_PATH",      "cmdb.db")
 
 # MOCK_MODE=true 이면 실제 HTTP 없이 샘플 데이터 반환

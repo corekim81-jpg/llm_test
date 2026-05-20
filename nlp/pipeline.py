@@ -23,6 +23,7 @@ nlp/pipeline.py — NL 처리 통합 파이프라인
 import logging
 import os
 import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from typing import Optional
@@ -220,11 +221,11 @@ if __name__ == "__main__":
     from monitoring_llm.cmdb.database import CMDB, seed_banksystem_16
 
     # cmdb = CMDB("/tmp/test_pipeline.db")
-    cmdb = CMDB("cmbdb.db")
+    cmdb = CMDB("cmdb.db")
     seed_banksystem_16(cmdb)
 
     # pipeline = NLPipeline(use_llm=False)  # 룰만 사용
-    
+
     # [개선 2] cmdb 주입
     pipeline = NLPipeline(use_llm=False, cmdb=cmdb)
 
@@ -237,12 +238,22 @@ if __name__ == "__main__":
             {
                 "current_servers": [
                     {
-                        "hostname": "was01-bank16",
-                        "ip": "192.168.16.20",
+                        # "hostname": "was01-bank16",
+                        # "ip": "192.168.16.20",
+                        # "role": "was",
+                        # "prometheus_instance": "192.168.16.20:9090",
+                        # "loki_host": "was01-bank16",
+                        # "prometheus_job": "jmx_exporter",
+                        # 수정 (실제 BankSystem_16 기준)
+                        "hostname": "ONTUNETEST2",
+                        "ip": "192.168.0.54",
                         "role": "was",
-                        "prometheus_instance": "192.168.16.20:9090",
-                        "loki_host": "was01-bank16",
-                        "prometheus_job": "jmx_exporter",
+                        "os": "windows",
+                        "tier": 2,
+                        "prometheus_job": "bank-was-hostmetrics",
+                        "app_job": "bank-was-app",
+                        "loki_service_name": "bank-was-tomcat-logs",
+                        "loki_server_role": "was",
                     }
                 ]
             },
@@ -252,12 +263,22 @@ if __name__ == "__main__":
             {
                 "current_servers": [
                     {
-                        "hostname": "was01-bank16",
-                        "ip": "192.168.16.20",
+                        # "hostname": "was01-bank16",
+                        # "ip": "192.168.16.20",
+                        # "role": "was",
+                        # "prometheus_instance": "192.168.16.20:9090",
+                        # "loki_host": "was01-bank16",
+                        # "prometheus_job": "jmx_exporter",
+                        # 수정 (실제 BankSystem_16 기준)
+                        "hostname": "ONTUNETEST2",
+                        "ip": "192.168.0.54",
                         "role": "was",
-                        "prometheus_instance": "192.168.16.20:9090",
-                        "loki_host": "was01-bank16",
-                        "prometheus_job": "jmx_exporter",
+                        "os": "windows",
+                        "tier": 2,
+                        "prometheus_job": "bank-was-hostmetrics",
+                        "app_job": "bank-was-app",
+                        "loki_service_name": "bank-was-tomcat-logs",
+                        "loki_server_role": "was",
                     }
                 ]
             },
@@ -279,17 +300,19 @@ if __name__ == "__main__":
             )
 
     # [개선 3] run_batch states 지원 테스트
-    print("\n\nrun_batch 멀티턴 테스트\n" + "="*60)
-    batch_texts  = [t for t, _ in CONVERSATION]
+    print("\n\nrun_batch 멀티턴 테스트\n" + "=" * 60)
+    batch_texts = [t for t, _ in CONVERSATION]
     batch_states = [s for _, s in CONVERSATION]
     results = pipeline.run_batch(batch_texts, states=batch_states)
     for i, bp in enumerate(results, 1):
-        print(f"[{i}] intent={bp.intent}, servers={[s.get('hostname') for s in bp.servers]}")
+        print(
+            f"[{i}] intent={bp.intent}, servers={[s.get('hostname') for s in bp.servers]}"
+        )
 
     # [개선 4] get_pipeline use_llm 변경 테스트
-    print("\n\nget_pipeline use_llm 변경 테스트\n" + "="*60)
+    print("\n\nget_pipeline use_llm 변경 테스트\n" + "=" * 60)
     p1 = get_pipeline(use_llm=False)
-    p2 = get_pipeline(use_llm=False)   # 동일 → 재사용
-    p3 = get_pipeline(use_llm=True)    # 변경 → 재생성
-    print(f"p1 is p2: {p1 is p2}")     # True
-    print(f"p2 is p3: {p2 is p3}")     # False
+    p2 = get_pipeline(use_llm=False)  # 동일 → 재사용
+    p3 = get_pipeline(use_llm=True)  # 변경 → 재생성
+    print(f"p1 is p2: {p1 is p2}")  # True
+    print(f"p2 is p3: {p2 is p3}")  # False

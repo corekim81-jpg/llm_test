@@ -1,50 +1,59 @@
 """
-Phase 1-A: CMDB (Configuration Management Database)
-──────────────────────────────────────────────────
-역할: 모든 쿼리의 기반. IP↔hostname 매핑, 서버 역할·소속·연관 서비스 저장.
-의존: sqlite3 (stdlib), json (stdlib)
-
-사용 예시:
-    cmdb = CMDB()
-    seed_banksystem_16(cmdb)
-    server = cmdb.get_by_ip("192.168.16.10")
-    print(server.hostname, server.role, server.prometheus_job)
+Phase 1-A: CMDB (Configuration Management Database)  [수정본]
+──────────────────────────────────────────────────────────────
+변경 요약:
+  - prometheus_instance(IP:port) 제거 → prometheus_job 으로만 필터
+  - app_job 추가 (WAS: bank-was-app — JVM/HTTP 앱 메트릭)
+  - loki_host → loki_service_name + loki_server_role 로 분리
+  - seed_banksystem_16: 실제 확인된 hostname/IP/job 값으로 교체
+    web: dev-masternode / 192.168.0.140 / bank-web-hostmetrics
+    was: ONTUNETEST2   / 192.168.0.54  / bank-was-hostmetrics + bank-was-app
+    db:  DESKTOP-H0M89JB / 192.168.0.63 / bank-db-hostmetrics
+  - _row() 순환 import 버그 수정
 """
 
 import json
+import re
 import sqlite3
-import re          # ← 추가
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Optional
-from contextlib import contextmanager
 
 
 @dataclass
 class ServerProfile:
     ip: str
     hostname: str
-    role: str  # "web" | "was" | "db"
-    os: str  # "linux" | "windows"
-    tier: int  # 1=web, 2=was, 3=db (MicroRCA METRIC_TIERS 연동)
+    role: str                   # "web" | "was" | "db"
+    os: str                     # "linux" | "windows"
+    tier: int                   # 1=web, 2=was, 3=db
     team: str
-    services: list = field(default_factory=list)
-    prometheus_job: str = ""
-    prometheus_instance: str = ""  # host:port 형식
-    loki_host: str = ""  # Loki {host="..."} 레이블 값
-    description: str = ""
+    services: list              = field(default_factory=list)
+    prometheus_job: str         = ""   # Prometheus job 레이블
+    app_job: str                = ""   # WAS 앱 메트릭 job (bank-was-app)
+    loki_service_name: str      = ""   # Loki service_name 레이블
+    loki_server_role: str       = ""   # Loki server_role 레이블
+    description: str            = ""
 
     def to_text(self) -> str:
         """LLM 응답용 자연어 설명 생성"""
         role_map = {
             "web": "Web Front (Apache)",
             "was": "WAS (Tomcat)",
-            "db": "DB (MySQL)",
+            "db":  "DB (MySQL)",
         }
+        app_job_line = (
+            f"  앱 메트릭 job: {self.app_job}\n" if self.app_job else ""
+        )
         return (
             f"[{self.hostname}] {role_map.get(self.role, self.role)} 서버\n"
             f"  IP: {self.ip} | OS: {self.os.upper()} | Tier {self.tier}\n"
             f"  담당팀: {self.team}\n"
             f"  구동 서비스: {', '.join(self.services)}\n"
+            f"  Prometheus job: {self.prometheus_job}\n"
+            f"{app_job_line}"
+            f"  Loki: service_name={self.loki_service_name}"
+            f" / server_role={self.loki_server_role}\n"
             f"  설명: {self.description}"
         )
 
@@ -54,7 +63,7 @@ class CMDB:
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
         self._init_db()
-    
+
     # ── 연결 관리 ────────────────────────────────────────────────
     def _get_conn(self) -> sqlite3.Connection:
         """영구 연결 반환 (없으면 생성). WAL 모드로 읽기 동시성 확보."""
@@ -66,7 +75,7 @@ class CMDB:
 
     @contextmanager
     def _tx(self):
-        """쓰기 전용 트랜잭션 컨텍스트 (예외 시 rollback)."""
+	    # """쓰기 전용 트랜잭션 컨텍스트 (예외 시 rollback)."""
         conn = self._get_conn()
         try:
             yield conn
@@ -86,11 +95,9 @@ class CMDB:
 
     def __exit__(self, *_):
         self.close()
-    
 
-    # ── DDL ──────────────────────────────────────────────────────    
+    # ── DDL ──────────────────────────────────────────────────────
     def _init_db(self):
-        # with sqlite3.connect(self.db_path) as conn:
         with self._tx() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS servers (
@@ -102,19 +109,18 @@ class CMDB:
                     team                TEXT NOT NULL,
                     services            TEXT DEFAULT '[]',
                     prometheus_job      TEXT DEFAULT '',
-                    prometheus_instance TEXT DEFAULT '',
-                    loki_host           TEXT DEFAULT '',
+                    app_job             TEXT DEFAULT '',
+                    loki_service_name   TEXT DEFAULT '',
+                    loki_server_role    TEXT DEFAULT '',
                     description         TEXT DEFAULT ''
                 )
-            """)            
+            """)
 
     # ── 쓰기 ─────────────────────────────────────────────────────
     def add_server(self, server: "ServerProfile"):
-    # def add_server(self, server: ServerProfile):
-        # with sqlite3.connect(self.db_path) as conn:
         with self._tx() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO servers VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO servers VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     server.ip,
                     server.hostname,
@@ -124,52 +130,28 @@ class CMDB:
                     server.team,
                     json.dumps(server.services, ensure_ascii=False),
                     server.prometheus_job,
-                    server.prometheus_instance,
-                    server.loki_host,
+                    server.app_job,
+                    server.loki_service_name,
+                    server.loki_server_role,
                     server.description,
                 ),
             )
 
-    # def get_by_ip(self, ip: str) -> Optional[ServerProfile]:
-    #     with sqlite3.connect(self.db_path) as conn:
-    #         row = conn.execute("SELECT * FROM servers WHERE ip = ?", (ip,)).fetchone()
-    #     return self._to_profile(row) if row else None
-        
+    # ── 읽기 ─────────────────────────────────────────────────────
     def get_by_ip(self, ip: str) -> Optional["ServerProfile"]:
         row = self._get_conn().execute(
             "SELECT * FROM servers WHERE ip = ?", (ip,)
         ).fetchone()
         return self._row(row)
-    
-    
 
-    # def get_by_hostname(self, name: str) -> Optional[ServerProfile]:
-    #     """부분 매칭 지원: 'web01' → 'web01-bank16'"""
-    #     with sqlite3.connect(self.db_path) as conn:
-    #         row = conn.execute(
-    #             "SELECT * FROM servers WHERE hostname LIKE ?", (f"%{name}%",)
-    #         ).fetchone()
-    #     return self._to_profile(row) if row else None
     def get_by_hostname(self, name: str) -> list["ServerProfile"]:
-        """
-        부분 매칭 지원 → 복수 결과 반환.
-        ('web' 검색 시 web01·web02 모두 반환)
-        """
+        """부분 매칭 — 복수 결과 반환."""
         rows = self._get_conn().execute(
             "SELECT * FROM servers WHERE hostname LIKE ? ORDER BY tier, hostname",
             (f"%{name}%",),
         ).fetchall()
-        return [self._row(r) for r in rows]            
+        return [self._row(r) for r in rows]
 
-    # def search(self, query: str) -> list[ServerProfile]:
-    #     """IP, hostname, role, description 통합 검색"""
-    #     with sqlite3.connect(self.db_path) as conn:
-    #         rows = conn.execute(
-    #             """SELECT * FROM servers WHERE
-    #                ip LIKE ? OR hostname LIKE ? OR role LIKE ? OR description LIKE ?""",
-    #             (f"%{query}%",) * 4,
-    #         ).fetchall()
-    #     return [self._to_profile(r) for r in rows]
     def search(self, query: str) -> list["ServerProfile"]:
         """IP / hostname / role / description 통합 LIKE 검색."""
         rows = self._get_conn().execute(
@@ -180,146 +162,110 @@ class CMDB:
         ).fetchall()
         return [self._row(r) for r in rows]
 
-    # def get_by_role(self, role: str) -> list[ServerProfile]:
-    #     with sqlite3.connect(self.db_path) as conn:
-    #         rows = conn.execute(
-    #             "SELECT * FROM servers WHERE role = ?", (role,)
-    #         ).fetchall()
-    #     return [self._to_profile(r) for r in rows]
     def get_by_role(self, role: str) -> list["ServerProfile"]:
         rows = self._get_conn().execute(
             "SELECT * FROM servers WHERE role = ? ORDER BY hostname", (role,)
         ).fetchall()
         return [self._row(r) for r in rows]
 
-    # def get_all(self) -> list[ServerProfile]:
-    #     with sqlite3.connect(self.db_path) as conn:
-    #         rows = conn.execute(
-    #             "SELECT * FROM servers ORDER BY tier, hostname"
-    #         ).fetchall()
-    #     return [self._to_profile(r) for r in rows]
     def get_all(self) -> list["ServerProfile"]:
         rows = self._get_conn().execute(
             "SELECT * FROM servers ORDER BY tier, hostname"
         ).fetchall()
         return [self._row(r) for r in rows]
 
-    # def resolve(self, identifier: str) -> Optional[ServerProfile]:
-    #     """IP 또는 hostname 자동 판별 후 조회"""
-    #     import re
-
-    #     if re.match(r"^\d+\.\d+\.\d+\.\d+$", identifier):
-    #         return self.get_by_ip(identifier)
+    # def resolve(self, identifier: str) -> list["ServerProfile"]:
+    #     """IP → 단건 리스트 / hostname → 부분 매칭 리스트."""
+    #     if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", identifier):
+    #         result = self.get_by_ip(identifier)
+    #         return [result] if result else []
     #     return self.get_by_hostname(identifier)
     def resolve(self, identifier: str) -> list["ServerProfile"]:
-        """
-        IP → 단건 리스트 / hostname → 부분 매칭 리스트.
-        항상 list 반환으로 타입 일관성 확보.
-        """
         if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", identifier):
             result = self.get_by_ip(identifier)
             return [result] if result else []
+
+        # ← 추가
+        if identifier.lower() in ("web", "was", "db"):
+            return self.get_by_role(identifier.lower())
+
         return self.get_by_hostname(identifier)
 
-    # def _to_profile(self, row) -> ServerProfile:
-    #     return ServerProfile(
-    #         ip=row[0],
-    #         hostname=row[1],
-    #         role=row[2],
-    #         os=row[3],
-    #         tier=row[4],
-    #         team=row[5],
-    #         services=json.loads(row[6]),
-    #         prometheus_job=row[7],
-    #         prometheus_instance=row[8],
-    #         loki_host=row[9],
-    #         description=row[10],
-    #     )
     # ── 내부 변환 ─────────────────────────────────────────────────
     def _row(self, row) -> Optional["ServerProfile"]:
+        """DB row → ServerProfile. 순환 import 없이 직접 생성."""
         if row is None:
             return None
-        from database import ServerProfile  # 순환 import 방지
-        return ServerProfile(
-            ip=row[0], hostname=row[1], role=row[2],
-            os=row[3], tier=row[4], team=row[5],
+        return ServerProfile(          # ← 같은 파일의 ServerProfile 직접 사용
+            ip=row[0],
+            hostname=row[1],
+            role=row[2],
+            os=row[3],
+            tier=row[4],
+            team=row[5],
             services=json.loads(row[6]),
             prometheus_job=row[7],
-            prometheus_instance=row[8],
-            loki_host=row[9],
-            description=row[10],
+            app_job=row[8],
+            loki_service_name=row[9],
+            loki_server_role=row[10],
+            description=row[11],
         )
 
 
+# ── BankSystem_16 초기 데이터 ────────────────────────────────────
 def seed_banksystem_16(cmdb: CMDB):
-    """BankSystem_16 초기 자산 데이터 등록 (Web×2 / WAS×2 / DB×2)"""
+    """
+    실제 확인된 값 기준:
+      Web : dev-masternode  / 192.168.0.140 / bank-web-hostmetrics
+      WAS : ONTUNETEST2    / 192.168.0.54  / bank-was-hostmetrics + bank-was-app
+      DB  : DESKTOP-H0M89JB / 192.168.0.63 / bank-db-hostmetrics
+    """
     servers = [
-        # ── Web Layer (Apache / Linux) ─────────────────────────────────
+        # ── Web Layer (Apache / Linux) ────────────────────────────
         ServerProfile(
             ip="192.168.0.140",
-            hostname="web-bank16",
+            hostname="dev-masternode",
             role="web",
             os="linux",
             tier=1,
             team="인프라팀",
-            services=["Apache 2.4", "AJP Connector :8009"],
-            prometheus_job="apache_exporter",
-            prometheus_instance="192.168.16.10:9117",
-            loki_host="web-bank16",
-            description="BankSystem_16 Web Front #1 (Apache/Linux) — L4 LB 뒷단",
+            services=["Apache 2.4", "mod_jk", "AJP Connector :8009"],
+            prometheus_job="bank-web-hostmetrics",
+            app_job="",                            # 앱 메트릭 별도 job 없음
+            loki_service_name="bank-web-httpd-logs",
+            loki_server_role="web",
+            description="BankSystem_16 Web Front (Apache/Linux) — mod_jk → WAS",
         ),
-        # ServerProfile(
-        #     ip="192.168.16.11", hostname="web02-bank16",
-        #     role="web", os="linux", tier=1, team="인프라팀",
-        #     services=["Apache 2.4", "AJP Connector :8009"],
-        #     prometheus_job="apache_exporter", prometheus_instance="192.168.16.11:9117",
-        #     loki_host="web02-bank16",
-        #     description="BankSystem_16 Web Front #2 (Apache/Linux) — L4 LB 뒷단",
-        # ),
-        # ── WAS Layer (Tomcat / Windows) ──────────────────────────────
+        # ── WAS Layer (Tomcat / Windows) ─────────────────────────
         ServerProfile(
             ip="192.168.0.54",
-            hostname="was-bank16",
+            hostname="ONTUNETEST2",
             role="was",
             os="windows",
             tier=2,
             team="개발팀",
             services=["Tomcat 9.0", "Spring Boot 2.7", "AJP :8009"],
-            prometheus_job="jmx_exporter",
-            prometheus_instance="192.168.16.20:9090",
-            loki_host="was-bank16",
-            description="BankSystem_16 WAS #1 (Tomcat/Windows) — web → AJP",
+            prometheus_job="bank-was-hostmetrics",  # 호스트 메트릭
+            app_job="bank-was-app",                 # JVM/HTTP 앱 메트릭
+            loki_service_name="bank-was-tomcat-logs",
+            loki_server_role="was",
+            description="BankSystem_16 WAS (Tomcat 9/Windows) — AJP ← web",
         ),
-        # ServerProfile(
-        #     ip="192.168.16.21", hostname="was02-bank16",
-        #     role="was", os="windows", tier=2, team="개발팀",
-        #     services=["Tomcat 9.0", "Spring Boot 2.7", "AJP :8009"],
-        #     prometheus_job="jmx_exporter", prometheus_instance="192.168.16.21:9090",
-        #     loki_host="was02-bank16",
-        #     description="BankSystem_16 WAS #2 (Tomcat/Windows) — web01·02 → AJP",
-        # ),
-        # ── DB Layer (MySQL / Windows) ────────────────────────────────
+        # ── DB Layer (MySQL / Windows) ────────────────────────────
         ServerProfile(
             ip="192.168.0.63",
-            hostname="db-bank16",
+            hostname="DESKTOP-H0M89JB",
             role="db",
             os="windows",
             tier=3,
             team="DBA팀",
-            services=["MySQL 8.0 Primary"],
-            prometheus_job="mysqld_exporter",
-            prometheus_instance="192.168.16.30:9104",
-            loki_host="db-bank16",
-            description="BankSystem_16 DB Primary (MySQL 8.0/Windows) — 쓰기 노드",
+            services=["MySQL 8.0"],
+            prometheus_job="bank-db-hostmetrics",
+            app_job="",                            # MySQL receiver 미설정
+            loki_service_name="",                  # 로그 미수집
+            loki_server_role="db",
+            description="BankSystem_16 DB (MySQL 8.0/Windows)",
         ),
-        # ServerProfile(
-        #     ip="192.168.16.31", hostname="db02-bank16",
-        #     role="db", os="windows", tier=3, team="DBA팀",
-        #     services=["MySQL 8.0 Replica"],
-        #     prometheus_job="mysqld_exporter", prometheus_instance="192.168.16.31:9104",
-        #     loki_host="db02-bank16",
-        #     description="BankSystem_16 DB Replica (MySQL 8.0/Windows) — 읽기 노드",
-        # ),
     ]
     for s in servers:
         cmdb.add_server(s)
@@ -327,58 +273,46 @@ def seed_banksystem_16(cmdb: CMDB):
     return servers
 
 
-# if __name__ == "__main__":
-#     cmdb = CMDB(db_path="test_cmdb.db")
-#     seed_banksystem_16(cmdb)
-
-#     print("\n=== IP 조회 테스트 ===")
-#     s = cmdb.get_by_ip("192.168.0.54")
-#     print(s.to_text())
-    
-#     for s in cmdb.get_by_hostname("was"):
-#         print(s.to_text())
-    
-
-#     print("\n=== hostname 부분 검색 ===")
-#     s = cmdb.get_by_hostname("was")
-#     print(s.to_text())
-
-#     print("\n=== 역할별 조회 (web) ===")
-#     for sv in cmdb.get_by_role("web"):
-#         print(f"  {sv.hostname} ({sv.ip})")
-
-#     print("\n=== resolve() — IP 또는 hostname 자동 판별 ===")
-#     for q in ["192.168.0.63", "was-bank16", "web"]:
-#         r = cmdb.resolve(q)
-#         print(f"  '{q}' → {r.hostname if r else 'NOT FOUND'}")
-
+# ── 독립 실행 테스트 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    import os, tempfile
+    import os
+    import tempfile
 
     db_path = os.path.join(tempfile.gettempdir(), "test_cmdb.db")
-    
-    # 매 테스트마다 깨끗하게 시작
     if os.path.exists(db_path):
         os.remove(db_path)
 
     cmdb = CMDB(db_path=db_path)
     seed_banksystem_16(cmdb)
 
-    print("\n=== IP 조회 테스트 ===")
+    print("\n=== IP 조회 ===")
     s = cmdb.get_by_ip("192.168.0.140")
     if s:
         print(s.to_text())
 
-    print("\n=== hostname 부분 검색 ===")
-    for s in cmdb.get_by_hostname("was"):   # ← for 루프 추가
+    print("\n=== hostname 부분 검색 (was) ===")
+    for s in cmdb.get_by_hostname("ONTUNETEST2"):
         print(s.to_text())
 
-    print("\n=== 역할별 조회 (web) ===")
-    for sv in cmdb.get_by_role("web"):
-        print(f"  {sv.hostname} ({sv.ip})")
+    print("\n=== 역할별 조회 (db) ===")
+    for sv in cmdb.get_by_role("db"):
+        print(f"  {sv.hostname} ({sv.ip}) | job={sv.prometheus_job}")
 
     print("\n=== resolve() ===")
-    for q in ["192.168.0.63", "was-bank16", "web"]:
+    for q in ["192.168.0.63", "ONTUNETEST2", "web"]:
         results = cmdb.resolve(q)
         for r in results:
-            print(f"  '{q}' → {r.hostname}")
+            print(
+                f"  '{q}' → {r.hostname}"
+                f" | prom_job={r.prometheus_job}"
+                f" | app_job={r.app_job or '-'}"
+                f" | loki={r.loki_service_name or '-'}"
+            )
+
+    print("\n=== 전체 서버 ===")
+    for sv in cmdb.get_all():
+        print(f"  Tier{sv.tier} {sv.hostname:<20} role={sv.role:<4}"
+              f" job={sv.prometheus_job}")
+
+    cmdb.close()
+    print("\n[CMDB] 테스트 완료")
