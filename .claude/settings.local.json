@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/AI/source/llm_test/**)",
+      "Bash(python -c ' *)",
+      "Bash(python -m monitoring_llm.nlp.intent_classifier)",
+      "PowerShell(cd \"D:\\\\AI\\\\source\\\\llm_test\"; $env:PYTHONIOENCODING=\"utf-8\"; python -m monitoring_llm.nlp.intent_classifier 2>&1)"
+    ]
+  }
+}

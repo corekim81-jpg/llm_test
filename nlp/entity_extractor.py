@@ -15,6 +15,15 @@ HOSTNAME_FULL_RE = re.compile(
     r'(?![a-zA-Z0-9_])',
     re.IGNORECASE,
 )
+
+# OTel trace service.name 패턴 — Tempo/Jaeger에서 보이는 서비스명
+# "ai-web-httpd", "bank-was-app" 등 role 키워드 포함 하이픈 구성
+OTEL_SERVICE_RE = re.compile(
+    r'(?<![a-zA-Z0-9_])'
+    r'([\w]+-(?:web|was|db|app)[\w-]*)'
+    r'(?![a-zA-Z0-9_])',
+    re.IGNORECASE,
+)
 # HOSTNAME_SHORT_RE = re.compile(
 #     r'(?<![a-zA-Z0-9_])'
 #     r'(web\d+|was\d+|db\d+|app\d+|proxy\d+|lb\d+|cache\d*|mq\d*|api\d*|auth\d+)'
@@ -109,11 +118,14 @@ def extract_entities(text: str) -> ExtractedEntities:
 
     e.ips = sorted(set(IP_RE.findall(text)))
 
-    full_names = [m.group(1).lower() for m in HOSTNAME_FULL_RE.finditer(text)]
+    full_names  = [m.group(1).lower() for m in HOSTNAME_FULL_RE.finditer(text)]
+    otel_names  = [m.group(1).lower() for m in OTEL_SERVICE_RE.finditer(text)
+                   if m.group(1).lower() not in full_names]
     short_names = [m.group(1).lower() for m in HOSTNAME_SHORT_RE.finditer(text)]
+    all_full    = full_names + otel_names
     filtered_short = [s for s in short_names
-                      if not any(f.startswith(s) for f in full_names)]
-    e.hostnames = sorted(set(full_names + filtered_short))
+                      if not any(f.startswith(s) for f in all_full)]
+    e.hostnames = sorted(set(all_full + filtered_short))
 
     # HTTP 에러코드: 4xx, 5xx 는 바로 추출
     e.http_errors = sorted(set(

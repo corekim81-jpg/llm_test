@@ -26,9 +26,10 @@ from monitoring_llm.nlp.time_parser import TimeRange, default_range
 
 CMDB_DB_PATH = os.getenv("CMDB_DB_PATH", "cmdb.db")
 
+# CMDB의 trace_service_name이 없을 때 role → 서비스명 폴백
 JAEGER_SERVICE_MAP: dict[str, str] = {
-    "web": "web-service",
-    "was": "was-service",
+    "web": "ai-web-httpd",
+    "was": "bank-was-app",
     "db":  "db-service",
 }
 
@@ -134,21 +135,30 @@ def _resolve_servers(entities: ExtractedEntities, cmdb=None) -> list[dict]:
             if server and server.ip not in seen:
                 seen.add(server.ip)
                 resolved.append({
-                    "hostname":          server.hostname,
-                    "ip":                server.ip,
-                    "role":              server.role,
-                    "os":                server.os,
-                    "tier":              server.tier,
-                    "prometheus_job":    server.prometheus_job,     # ← 변경
-                    "app_job":           server.app_job,            # ← 추가
-                    "loki_service_name": server.loki_service_name,  # ← 변경
-                    "loki_server_role":  server.loki_server_role,   # ← 변경
+                    "hostname":           server.hostname,
+                    "ip":                 server.ip,
+                    "role":               server.role,
+                    "os":                 server.os,
+                    "tier":               server.tier,
+                    "prometheus_job":     server.prometheus_job,
+                    "app_job":            server.app_job,
+                    "loki_service_name":  server.loki_service_name,
+                    "loki_server_role":   server.loki_server_role,
+                    "trace_service_name": server.trace_service_name,  # Tempo/Jaeger
                 })
     return resolved
 
 
 def _role_to_jaeger(role: str) -> str:
     return JAEGER_SERVICE_MAP.get(role, f"{role}-service")
+
+
+def _server_to_trace_service(server: dict) -> str:
+    """서버 dict → 트레이스 서비스명. CMDB의 trace_service_name 우선, 없으면 role 폴백."""
+    svc = server.get("trace_service_name", "")
+    if svc:
+        return svc
+    return _role_to_jaeger(server.get("role", "was"))
 
 
 # ── 핵심 바인딩 로직 ───────────────────────────────────────────────
@@ -191,23 +201,24 @@ def bind_params(
                 kw.replace("_", "\\s*") for kw in bp.keywords[:3]
             )
 
-        # 서버 미지정 → 전체 조회 폴백 (loki_service_name 없이 빈 값)
+        # 서버 미지정 → 전체 조회 폴백
         if not bp.servers:
             bp.servers = [{
-                "hostname":          "all",
-                "loki_service_name": "",   # ← 변경 (loki_host 제거)
-                "loki_server_role":  "",
-                "role":              "web",
-                "prometheus_job":    "",
-                "app_job":           "",
+                "hostname":           "all",
+                "loki_service_name":  "",
+                "loki_server_role":   "",
+                "role":               "web",
+                "prometheus_job":     "",
+                "app_job":            "",
+                "trace_service_name": "",
             }]
 
         if bp.servers:
             bp.jaeger_services = [
-                _role_to_jaeger(s.get("role", "was"))
+                _server_to_trace_service(s)
                 for s in bp.servers
                 if s.get("hostname") != "all"
-            ] or ["was-service"]
+            ] or [JAEGER_SERVICE_MAP.get("was", "bank-was-app")]
 
     elif intent == QueryIntent.MULTI_MODAL:
         bp.loki_level_filter = "ERROR|WARN"
@@ -216,7 +227,7 @@ def bind_params(
             bp.loki_keyword = "|".join(bp.keywords[:2])
         if bp.servers:
             bp.jaeger_services = [
-                _role_to_jaeger(s.get("role", "was")) for s in bp.servers[:2]
+                _server_to_trace_service(s) for s in bp.servers[:2]
             ]
 
     elif intent == QueryIntent.ACTION_RECOMMEND:

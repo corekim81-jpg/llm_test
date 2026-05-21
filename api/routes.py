@@ -152,10 +152,20 @@ async def health_check():
     # import requests
     from datetime import datetime
 
+    # 트레이스 백엔드: JAEGER_URL 우선, 없으면 TEMPO_URL
+    _jaeger = os.getenv("JAEGER_URL", "")
+    _tempo  = os.getenv("TEMPO_URL",  "")
+    if _jaeger:
+        _trace_entry = ("jaeger", _jaeger + "/api/services")
+    elif _tempo:
+        _trace_entry = ("tempo",  _tempo  + "/api/search/tag/service.name/values")
+    else:
+        _trace_entry = ("trace",  "http://localhost:0/")  # 미설정 → unreachable 예상
+
     endpoints = [
         ("prometheus", os.getenv("PROMETHEUS_URL",  "http://localhost:9090") + "/-/healthy"),
         ("loki",       os.getenv("LOKI_URL",        "http://localhost:3100")  + "/ready"),
-        ("jaeger",     os.getenv("JAEGER_URL",      "http://localhost:16686") + "/api/services"),
+        _trace_entry,
         ("ollama",     os.getenv("OLLAMA_BASE_URL", "http://localhost:11434") + "/api/tags"),
     ]
     checks: dict[str, str] = {}

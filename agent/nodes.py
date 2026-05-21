@@ -142,15 +142,16 @@ def _resolve_role_fallback(state: dict) -> list[dict]:
             servers = cmdb.get_all()
             return [
                 {
-                    "hostname":          s.hostname,
-                    "ip":                s.ip,
-                    "role":              s.role,
-                    "os":                s.os,
-                    "tier":              s.tier,
-                    "prometheus_job":    s.prometheus_job,
-                    "app_job":           s.app_job,
-                    "loki_service_name": s.loki_service_name,
-                    "loki_server_role":  s.loki_server_role,
+                    "hostname":           s.hostname,
+                    "ip":                 s.ip,
+                    "role":               s.role,
+                    "os":                 s.os,
+                    "tier":               s.tier,
+                    "prometheus_job":     s.prometheus_job,
+                    "app_job":            s.app_job,
+                    "loki_service_name":  s.loki_service_name,
+                    "loki_server_role":   s.loki_server_role,
+                    "trace_service_name": s.trace_service_name,
                 }
                 for s in servers
             ]
@@ -331,13 +332,14 @@ def node_call_multi(state: dict) -> dict:
                 cmdb    = CMDB(os.getenv("CMDB_DB_PATH", "cmdb.db"))
                 servers = [
                     {
-                        "hostname":          s.hostname,
-                        "ip":                s.ip,
-                        "role":              s.role,
-                        "prometheus_job":    s.prometheus_job,
-                        "app_job":           s.app_job,
-                        "loki_service_name": s.loki_service_name,
-                        "loki_server_role":  s.loki_server_role,
+                        "hostname":           s.hostname,
+                        "ip":                 s.ip,
+                        "role":               s.role,
+                        "prometheus_job":     s.prometheus_job,
+                        "app_job":            s.app_job,
+                        "loki_service_name":  s.loki_service_name,
+                        "loki_server_role":   s.loki_server_role,
+                        "trace_service_name": s.trace_service_name,
                     }
                     for s in cmdb.get_all()
                 ]
@@ -428,7 +430,30 @@ def node_call_error(state: dict) -> dict:
     kw          = (bp.loki_keyword      if bp else "") or ""
     status      = (bp.loki_status_code  if bp else "") or "5xx"
     level       = (bp.loki_level_filter if bp else "") or ""
-    jaeger_svcs = (bp.jaeger_services   if bp else []) or ["was-service"]
+
+    # ── jaeger_svcs 동적 구성 ─────────────────────────────────────
+    # 1순위: 현재 servers의 trace_service_name 직접 추출 (빈 문자열 제거)
+    # 2순위: param_binder가 채운 bp.jaeger_services (빈 문자열 제거)
+    # 3순위: CMDB에서 was → web 역할 순으로 trace_service_name 동적 조회
+    real = [s for s in servers if s.get("hostname") != "all"]
+    jaeger_svcs = [s.get("trace_service_name", "") for s in real if s.get("trace_service_name")]
+
+    if not jaeger_svcs and bp and bp.jaeger_services:
+        jaeger_svcs = [svc for svc in bp.jaeger_services if svc]
+
+    if not jaeger_svcs:
+        try:
+            from monitoring_llm.cmdb.database import CMDB
+            _cmdb = CMDB(os.getenv("CMDB_DB_PATH", "cmdb.db"))
+            jaeger_svcs = [
+                s.trace_service_name
+                for role in ("was", "web")
+                for s in _cmdb.get_by_role(role)
+                if s.trace_service_name
+            ]
+            log.info("[node_call_error] CMDB trace services: %s", jaeger_svcs)
+        except Exception as e:
+            log.warning("[node_call_error] CMDB trace_service 조회 실패: %s", e)
 
     for s in [sv for sv in servers if sv.get("hostname") != "all"][:2]:
         hostname = s.get("hostname", "")
@@ -454,7 +479,7 @@ def node_call_error(state: dict) -> dict:
     if not real_servers:
         results["global"] = {"info": "조회할 서버가 지정되지 않았습니다."}
 
-    for svc in jaeger_svcs[:2]:
+    for svc in [s for s in jaeger_svcs[:2] if s]:
         results[f"trace_{svc}"] = jaeger_tool._run(
             service_name    = svc,
             start_ts        = start_ts,
@@ -522,8 +547,8 @@ SYSTEM_PROMPT = """/no_think
 3. 조치 추천 시 [즉시 조치] / [단기 개선] / [모니터링] 섹션으로 구분하세요.
 4. 운영자 승인이 필요한 조치는 ⚠️ 표시하세요.
 5. 근거 없는 추측은 하지 마세요.
-6. 한국어로 답변하세요.
-7. Jaeger/Alertmanager 미설정은 즉시 조치가 아닙니다. 낮은 우선순위로만 언급하세요."""
+6. 한국어로 답변하세요."""
+# 7. Jaeger/Alertmanager 미설정은 즉시 조치가 아닙니다. 낮은 우선순위로만 언급하세요.
 
 
 def node_respond(state: dict) -> dict:

@@ -105,7 +105,8 @@ The session resolves server references ("was01") to full metadata by querying th
 | `OLLAMA_MODEL` | `qwen3:8b` | LLM model |
 | `PROMETHEUS_URL` | `http://192.168.0.41:9092` | Metrics backend |
 | `LOKI_URL` | `http://192.168.0.41:3101` | Log backend |
-| `JAEGER_URL` | — | Trace backend |
+| `JAEGER_URL` | — | Jaeger trace backend (JAEGER_URL 우선 사용) |
+| `TEMPO_URL` | — | Grafana Tempo trace backend (JAEGER_URL 없을 때 사용) |
 | `CMDB_DB_PATH` | `cmdb.db` | SQLite path |
 | `MOCK_MODE` | `false` | Return mock data instead of querying backends |
 | `SESSION_TTL_HOURS` | `2` | Session expiry |

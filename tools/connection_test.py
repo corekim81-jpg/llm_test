@@ -6,6 +6,7 @@ tools/connection_test.py — 연결 상태 진단 + 도구 레지스트리  [수
   - test_loki_streams:       host= → service_name=, 5분→24h, DB 스킵
   - test_tools_mock:         prometheus_instance/loki_host → 신규 파라미터
   - CMDBLookupTool 검증:     IP 192.168.0.140 / hostname dev-masternode
+  - 트레이스 백엔드:          Jaeger / Grafana Tempo 자동 선택
 """
 
 import json
@@ -16,12 +17,14 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from monitoring_llm.tools.base import (
-    PROMETHEUS_URL, LOKI_URL, JAEGER_URL, ALERTMANAGER_URL,
+    PROMETHEUS_URL, LOKI_URL, JAEGER_URL, TEMPO_URL, ALERTMANAGER_URL,
     MOCK_MODE, safe_get, get_session,
 )
 from monitoring_llm.tools.prometheus_tool import PrometheusQueryTool, PROMQL
 from monitoring_llm.tools.loki_tool import LokiQueryTool, LogQLBuilder
-from monitoring_llm.tools.jaeger_tool import JaegerTraceListTool, list_jaeger_services
+from monitoring_llm.tools.jaeger_tool import (
+    JaegerTraceListTool, list_jaeger_services, _get_backend,
+)
 
 try:
     from langchain_core.tools import BaseTool
@@ -48,10 +51,19 @@ def test_connections() -> dict[str, bool]:
 
     import requests as _req
 
+    # 트레이스 백엔드: JAEGER_URL 우선, 없으면 TEMPO_URL
+    _trace_backend, _trace_url = _get_backend()
+    if _trace_backend == "jaeger":
+        _trace_check = ("Jaeger",  f"{_trace_url}/api/services",                    None)
+    elif _trace_backend == "tempo":
+        _trace_check = ("Tempo",   f"{_trace_url}/api/search/tag/service.name/values", None)
+    else:
+        _trace_check = ("Trace",   "http://localhost:0/",                            None)  # 연결 실패 예상
+
     checks = [
-        ("Prometheus",   f"{PROMETHEUS_URL}/-/healthy",   "Healthy"),  # "Prometheus Server is Healthy." 포함
+        ("Prometheus",   f"{PROMETHEUS_URL}/-/healthy",   "Healthy"),
         ("Loki",         f"{LOKI_URL}/ready",              "ready"),
-        ("Jaeger",       f"{JAEGER_URL}/api/services",     None),
+        _trace_check,
         ("Alertmanager", f"{ALERTMANAGER_URL}/-/healthy",  "OK"),
     ]
 
@@ -175,19 +187,22 @@ def test_loki_streams() -> dict[str, bool]:
     return results
 
 
-# ── 4. Jaeger 서비스 확인 ─────────────────────────────────────────
+# ── 4. 트레이스 서비스 확인 (Jaeger / Tempo) ──────────────────────
 def test_jaeger_services() -> dict[str, bool]:
-    print("\n[4] Jaeger 서비스 목록 확인")
+    backend, _ = _get_backend()
+    label      = "Tempo" if backend == "tempo" else "Jaeger"
+    print(f"\n[4] {label} 서비스 목록 확인")
     services = list_jaeger_services()
     results  = {}
 
-    expected = ["web-service", "was-service", "db-service"]
+    # 실제 OTel SDK service.name 기준 (Tempo/Jaeger 공통)
+    expected = ["ai-web-httpd", "bank-was-app"]
     print(f"  {INFO} 발견된 서비스: {services[:10]}")
     for svc in expected:
         found = any(svc.lower() in s.lower() for s in services)
         results[svc] = found
         _check(f"{svc}", found,
-               "" if found else "OTel SDK service.name 설정 확인 필요")
+               "" if found else "OTel SDK service.name 확인 — CMDB trace_service_name 참고")
 
     return results
 
@@ -265,7 +280,7 @@ def test_tools_mock() -> dict[str, bool]:
 
         tool   = JaegerTraceListTool()
         result = tool._run(
-            service_name = "was-service",
+            service_name = "bank-was-app",   # 실제 Tempo service.name
             start_ts     = tr.start_ts,
             end_ts       = tr.end_ts,
         )
@@ -355,12 +370,15 @@ def get_all_tools():
 
 # ── main ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    _backend, _burl = _get_backend()
     print(f"{'='*55}")
     print("Phase 2 도구 레이어 연결 테스트")
     print(f"MOCK_MODE={MOCK_MODE}")
     print(f"PROMETHEUS_URL={PROMETHEUS_URL}")
     print(f"LOKI_URL={LOKI_URL}")
-    print(f"JAEGER_URL={JAEGER_URL}")
+    print(f"JAEGER_URL={JAEGER_URL or '(미설정)'}")
+    print(f"TEMPO_URL={TEMPO_URL  or '(미설정)'}")
+    print(f"TRACE_BACKEND={_backend.upper()} ({_burl or '-'})")
     print(f"{'='*55}")
 
     all_results = {}
@@ -372,7 +390,7 @@ if __name__ == "__main__":
         all_results["서비스 연결"]        = test_connections()
         all_results["Prometheus 메트릭"]  = test_prometheus_metrics()
         all_results["Loki 스트림"]        = test_loki_streams()
-        all_results["Jaeger 서비스"]      = test_jaeger_services()
+        all_results["트레이스 서비스"]     = test_jaeger_services()
         all_results["Tool Mock 테스트"]   = test_tools_mock()
 
     print_report(all_results)

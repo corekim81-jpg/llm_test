@@ -20,6 +20,7 @@ log = logging.getLogger("monitoring_llm.tools")
 PROMETHEUS_URL    = os.getenv("PROMETHEUS_URL",    "http://192.168.0.41:9092")
 LOKI_URL          = os.getenv("LOKI_URL",          "http://192.168.0.41:3101")
 JAEGER_URL        = os.getenv("JAEGER_URL",        "")
+TEMPO_URL         = os.getenv("TEMPO_URL",         "")
 ALERTMANAGER_URL  = os.getenv("ALERTMANAGER_URL",  "")
 CMDB_DB_PATH      = os.getenv("CMDB_DB_PATH",      "cmdb.db")
 

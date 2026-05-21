@@ -162,6 +162,11 @@ def _ask_info(_, tl):
     )
 
 
+def _has_err_natural(_, tl):
+    """한국어 에러/오류 자연어 표현 (HTTP 코드 아닌 단어 기반)"""
+    return bool(re.search(r"에러|오류|error\b", tl))
+
+
 # ── [개선 1, 2] 룰 우선순위 재조정 ─────────────────────────────────
 # 변경 전: ACTION_RECOMMEND 가 최우선 → "OOM 해결 방법" 이 ERROR_ANALYSIS 대신 ACTION_RECOMMEND 로 분류
 # 변경 후:
@@ -170,13 +175,16 @@ def _ask_info(_, tl):
 
 RULES = [
     # ← 여기에 추가 (기존 첫 번째 룰보다 앞에)
-    # HTTP 에러코드 + 존재 질문 → error_analysis (Loki 로그 조회)
+    # HTTP 에러코드 또는 자연어 에러 + 존재/발생 질문 → error_analysis
+    # "에러가 발생하고 있어?", "500 에러 있어?", "어떤 에러가 발생하고 있어?" 등
+    # 단, 메트릭+로그 동시 요청(multi_modal)은 제외
     (
-        lambda t, tl: _has_err(t, tl)
-        and re.search(r"있었어|있어|발생|나왔어|떴어|확인", tl),
+        lambda t, tl: (_has_err(t, tl) or _has_err_natural(t, tl))
+        and re.search(r"있었어|있어|발생|나왔어|떴어|확인|어떤\s*에러", tl)
+        and not (_has_metric(t, tl) and _has_log(t, tl)),
         QueryIntent.ERROR_ANALYSIS,
         0.93,
-        "에러코드 + 존재 질문",
+        "에러(코드/자연어) + 존재/발생 질문",
     ),
     # [개선 2] 에러+원인+조치가 동시에 있으면 ERROR_ANALYSIS 우선
     # "OOM 해결 방법 알려줘", "500 에러 원인이랑 조치 방법"
@@ -260,11 +268,19 @@ RULES = [
         0.88,
         "메트릭 조회",
     ),
-    # [개선 1] "어제 OOM 왜 발생했어?" 는 ERROR_ANALYSIS(위)에서 먼저 잡힘
-    # 과거 시간 + 문제 (에러 원인 질문 아님)
-    # 과거 시간 + 문제 (원인 질문 아님)
+    # 에러/오류 키워드 + 로그 → ERROR_ANALYSIS (INCIDENT_HISTORY보다 앞에)
+    # "bank-was-app 에서 에러가 나는데 최근 1시간 로그 확인해줘" 같은 패턴
     (
-        lambda t, tl: _has_past(t, tl) and _has_trouble(t, tl) and not _ask_why(t, tl),
+        lambda t, tl: _has_err_natural(t, tl) and _has_log(t, tl),
+        QueryIntent.ERROR_ANALYSIS,
+        0.90,
+        "에러/오류 + 로그 조회",
+    ),
+    # [개선 1] "어제 OOM 왜 발생했어?" 는 ERROR_ANALYSIS(위)에서 먼저 잡힘
+    # 과거 시간 + 문제 (에러 원인 질문 아님, 로그 요청 아님)
+    (
+        lambda t, tl: _has_past(t, tl) and _has_trouble(t, tl)
+                      and not _ask_why(t, tl) and not _has_log(t, tl),
         QueryIntent.INCIDENT_HISTORY,
         0.92,
         "과거 시간 + 문제/장애",
@@ -556,6 +572,9 @@ TEST_CASES = [
     ("해결 방법 알려줘", "action_recommend"),
     ("OOM 해결 방법 알려줘", "action_recommend"),
     ("web 서버 디스크가 꽉 찼는데 어떻게 해야 해?", "action_recommend"),  # ← 추가
+    ("bank-was-app 에서 에러가 나는데 최근 1시간 로그 확인해줘", "error_analysis"),  # ← 추가
+    ("was 서버에서 일주일 내에 어떤 에러가 발생하고 있어?", "error_analysis"),      # ← 추가
+    ("최근 이슈 알려줘", "incident_history"),  # 최근 + 로그 없음 → incident_history 유지
 ]
 
 

@@ -5,9 +5,11 @@ Phase 1-A: CMDB (Configuration Management Database)  [수정본]
   - prometheus_instance(IP:port) 제거 → prometheus_job 으로만 필터
   - app_job 추가 (WAS: bank-was-app — JVM/HTTP 앱 메트릭)
   - loki_host → loki_service_name + loki_server_role 로 분리
+  - trace_service_name 추가 (Tempo/Jaeger OTel service.name 레이블)
+    loki_service_name(로그)과 별개 — Tempo 트레이스 조회 시 사용
   - seed_banksystem_16: 실제 확인된 hostname/IP/job 값으로 교체
-    web: dev-masternode / 192.168.0.140 / bank-web-hostmetrics
-    was: ONTUNETEST2   / 192.168.0.54  / bank-was-hostmetrics + bank-was-app
+    web: dev-masternode / 192.168.0.140 / bank-web-hostmetrics / trace: ai-web-httpd
+    was: ONTUNETEST2   / 192.168.0.54  / bank-was-hostmetrics + bank-was-app / trace: bank-was-app
     db:  DESKTOP-H0M89JB / 192.168.0.63 / bank-db-hostmetrics
   - _row() 순환 import 버그 수정
 """
@@ -31,9 +33,10 @@ class ServerProfile:
     services: list              = field(default_factory=list)
     prometheus_job: str         = ""   # Prometheus job 레이블
     app_job: str                = ""   # WAS 앱 메트릭 job (bank-was-app)
-    loki_service_name: str      = ""   # Loki service_name 레이블
+    loki_service_name: str      = ""   # Loki service_name 레이블 (로그 조회)
     loki_server_role: str       = ""   # Loki server_role 레이블
     description: str            = ""
+    trace_service_name: str     = ""   # Tempo/Jaeger OTel service.name (트레이스 조회)
 
     def to_text(self) -> str:
         """LLM 응답용 자연어 설명 생성"""
@@ -54,6 +57,7 @@ class ServerProfile:
             f"{app_job_line}"
             f"  Loki: service_name={self.loki_service_name}"
             f" / server_role={self.loki_server_role}\n"
+            f"  Trace: service_name={self.trace_service_name or '(미수집)'}\n"
             f"  설명: {self.description}"
         )
 
@@ -112,15 +116,25 @@ class CMDB:
                     app_job             TEXT DEFAULT '',
                     loki_service_name   TEXT DEFAULT '',
                     loki_server_role    TEXT DEFAULT '',
-                    description         TEXT DEFAULT ''
+                    description         TEXT DEFAULT '',
+                    trace_service_name  TEXT DEFAULT ''
                 )
             """)
+            # 기존 DB 마이그레이션 — trace_service_name 컬럼 없는 경우 추가
+            try:
+                conn.execute("ALTER TABLE servers ADD COLUMN trace_service_name TEXT DEFAULT ''")
+            except Exception:
+                pass  # 이미 존재하는 컬럼
 
     # ── 쓰기 ─────────────────────────────────────────────────────
     def add_server(self, server: "ServerProfile"):
         with self._tx() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO servers VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                """INSERT OR REPLACE INTO servers
+                   (ip, hostname, role, os, tier, team, services,
+                    prometheus_job, app_job, loki_service_name, loki_server_role,
+                    description, trace_service_name)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     server.ip,
                     server.hostname,
@@ -134,6 +148,7 @@ class CMDB:
                     server.loki_service_name,
                     server.loki_server_role,
                     server.description,
+                    server.trace_service_name,
                 ),
             )
 
@@ -185,11 +200,23 @@ class CMDB:
             result = self.get_by_ip(identifier)
             return [result] if result else []
 
-        # ← 추가
         if identifier.lower() in ("web", "was", "db"):
             return self.get_by_role(identifier.lower())
 
-        return self.get_by_hostname(identifier)
+        # hostname 부분 매칭 우선
+        by_host = self.get_by_hostname(identifier)
+        if by_host:
+            return by_host
+
+        # OTel service name(trace_service_name / loki_service_name)으로도 검색
+        # "bank-was-app", "ai-web-httpd" 같은 서비스명 입력 시
+        rows = self._get_conn().execute(
+            """SELECT * FROM servers
+               WHERE trace_service_name LIKE ? OR loki_service_name LIKE ?
+               ORDER BY tier, hostname""",
+            (f"%{identifier}%", f"%{identifier}%"),
+        ).fetchall()
+        return [r for r in (self._row(row) for row in rows) if r]
 
     # ── 내부 변환 ─────────────────────────────────────────────────
     def _row(self, row) -> Optional["ServerProfile"]:
@@ -209,6 +236,7 @@ class CMDB:
             loki_service_name=row[9],
             loki_server_role=row[10],
             description=row[11],
+            trace_service_name=row[12] if len(row) > 12 else "",
         )
 
 
@@ -216,9 +244,9 @@ class CMDB:
 def seed_banksystem_16(cmdb: CMDB):
     """
     실제 확인된 값 기준:
-      Web : dev-masternode  / 192.168.0.140 / bank-web-hostmetrics
-      WAS : ONTUNETEST2    / 192.168.0.54  / bank-was-hostmetrics + bank-was-app
-      DB  : DESKTOP-H0M89JB / 192.168.0.63 / bank-db-hostmetrics
+      Web : dev-masternode  / 192.168.0.140 / bank-web-hostmetrics / trace: ai-web-httpd
+      WAS : ONTUNETEST2    / 192.168.0.54  / bank-was-hostmetrics + bank-was-app / trace: bank-was-app
+      DB  : DESKTOP-H0M89JB / 192.168.0.63 / bank-db-hostmetrics / trace: 미수집
     """
     servers = [
         # ── Web Layer (Apache / Linux) ────────────────────────────
@@ -231,10 +259,11 @@ def seed_banksystem_16(cmdb: CMDB):
             team="인프라팀",
             services=["Apache 2.4", "mod_jk", "AJP Connector :8009"],
             prometheus_job="bank-web-hostmetrics",
-            app_job="",                            # 앱 메트릭 별도 job 없음
+            app_job="",
             loki_service_name="bank-web-httpd-logs",
             loki_server_role="web",
             description="BankSystem_16 Web Front (Apache/Linux) — mod_jk → WAS",
+            trace_service_name="ai-web-httpd",     # OTel SDK service.name (Tempo)
         ),
         # ── WAS Layer (Tomcat / Windows) ─────────────────────────
         ServerProfile(
@@ -245,11 +274,12 @@ def seed_banksystem_16(cmdb: CMDB):
             tier=2,
             team="개발팀",
             services=["Tomcat 9.0", "Spring Boot 2.7", "AJP :8009"],
-            prometheus_job="bank-was-hostmetrics",  # 호스트 메트릭
-            app_job="bank-was-app",                 # JVM/HTTP 앱 메트릭
+            prometheus_job="bank-was-hostmetrics",
+            app_job="bank-was-app",
             loki_service_name="bank-was-tomcat-logs",
             loki_server_role="was",
             description="BankSystem_16 WAS (Tomcat 9/Windows) — AJP ← web",
+            trace_service_name="bank-was-app",     # OTel SDK service.name (Tempo) = app_job 동일
         ),
         # ── DB Layer (MySQL / Windows) ────────────────────────────
         ServerProfile(
@@ -261,10 +291,11 @@ def seed_banksystem_16(cmdb: CMDB):
             team="DBA팀",
             services=["MySQL 8.0"],
             prometheus_job="bank-db-hostmetrics",
-            app_job="",                            # MySQL receiver 미설정
-            loki_service_name="",                  # 로그 미수집
+            app_job="",
+            loki_service_name="",
             loki_server_role="db",
             description="BankSystem_16 DB (MySQL 8.0/Windows)",
+            trace_service_name="",                 # 트레이스 미수집
         ),
     ]
     for s in servers:
