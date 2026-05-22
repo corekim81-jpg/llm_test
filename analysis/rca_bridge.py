@@ -52,8 +52,9 @@ from typing import Optional, Any
 
 log = logging.getLogger("monitoring_llm.analysis")
 
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "qwen3:8b")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "../.."))
+from monitoring_llm.llm_factory import build_chat_llm
 
 # CMDB에서 메트릭명 → 서버명 변환용 접두어 매핑
 # [FIX] prefix를 정확한 노드명(web01/web02)으로 확장 가능한 구조로 유지
@@ -118,14 +119,10 @@ _PREFIX_RE = re.compile(
 _llm_instance: Optional[object] = None
 
 def _get_llm():
-    """ChatOllama 인스턴스를 최초 1회만 생성 후 재사용."""
+    """LLM 인스턴스를 최초 1회만 생성 후 재사용 (llm_factory 위임)."""
     global _llm_instance
     if _llm_instance is None:
-        from langchain_ollama import ChatOllama
-        _llm_instance = ChatOllama(
-            model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL,
-            temperature=0.2, num_predict=1200, num_ctx=4096,
-        )
+        _llm_instance = build_chat_llm(temperature=0.2, max_tokens=1200, num_ctx=4096)
     return _llm_instance
 
 

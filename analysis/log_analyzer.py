@@ -37,8 +37,9 @@ from typing import Optional
 
 log = logging.getLogger("monitoring_llm.analysis")
 
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "../.."))
+from monitoring_llm.llm_factory import build_chat_llm
 
 
 # ── BankSystem_16 환경 기준 에러 패턴 사전 ───────────────────────────
@@ -74,23 +75,14 @@ TRACE_ID_RE = re.compile(
 LEVEL_RE = re.compile(r"\b(ERROR|WARN|INFO|DEBUG|FATAL|TRACE)\b")
 
 # ── LLM 싱글톤 캐시 ──────────────────────────────────────────────────
-# [FIX] explain() 호출마다 ChatOllama 인스턴스를 새로 생성하던 문제 해결
 _llm_instance: Optional[object] = None
 
 
 def _get_llm():
-    """ChatOllama 인스턴스를 최초 1회만 생성 후 재사용."""
+    """LLM 인스턴스를 최초 1회만 생성 후 재사용 (llm_factory 위임)."""
     global _llm_instance
     if _llm_instance is None:
-        from langchain_ollama import ChatOllama
-
-        _llm_instance = ChatOllama(
-            model=OLLAMA_MODEL,
-            base_url=OLLAMA_BASE_URL,
-            temperature=0.1,
-            num_predict=1000,
-            num_ctx=4096,
-        )
+        _llm_instance = build_chat_llm(temperature=0.1, max_tokens=1000, num_ctx=4096)
     return _llm_instance
 
 

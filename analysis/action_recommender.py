@@ -25,8 +25,9 @@ from typing import Optional
 
 log = logging.getLogger("monitoring_llm.analysis")
 
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "qwen3:8b")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "../.."))
+from monitoring_llm.llm_factory import build_chat_llm
 
 
 # ── Runbook 사전 ──────────────────────────────────────────────────────
@@ -383,16 +384,12 @@ def _llm_refine(
     rca_result: Optional[dict],
 ) -> list[ActionPlan]:
     try:
-        from langchain_ollama import ChatOllama
         from langchain_core.messages import HumanMessage, SystemMessage
 
         context = to_markdown_report(plans)
         rca_ctx = json.dumps(rca_result, ensure_ascii=False) if rca_result else "없음"
 
-        llm = ChatOllama(
-            model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL,
-            temperature=0.2, num_predict=1500, num_ctx=4096,
-        )
+        llm = build_chat_llm(temperature=0.2, max_tokens=1500, num_ctx=4096)
 
         prompt = (
             f"[현재 장애 상황]\n에러 패턴: {patterns}\nRCA 결과: {rca_ctx}\n\n"

@@ -14,6 +14,7 @@ pydantic==2.13.4
 # ── LangChain / LangGraph ────────────────────────────────────
 langchain-core==1.3.3
 langchain-ollama==1.1.0    # Ollama (Qwen3:8b 등 로컬 LLM)
+langchain-anthropic>=0.3.0 # Anthropic Claude (LLM_PROVIDER=anthropic 시 필요)
 langgraph==1.1.10
 
 # ── HTTP 클라이언트 ───────────────────────────────────────────

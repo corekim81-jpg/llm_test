@@ -29,6 +29,7 @@ from pydantic import BaseModel
 
 from monitoring_llm.api.session import get_store
 from monitoring_llm.api.sse import stream_agent, sse_event
+from monitoring_llm.llm_factory import LLM_PROVIDER, OLLAMA_BASE_URL, provider_info
 
 log = logging.getLogger("monitoring_llm.api")
 router = APIRouter(tags=["monitoring-llm"])
@@ -146,6 +147,15 @@ async def list_sessions():
     return {"active_count": store.active_count, "sessions": store.all_meta()}
 
 
+def _llm_health_entry() -> list[tuple]:
+    """LLM 프로바이더에 따라 헬스체크 엔드포인트 반환"""
+    if LLM_PROVIDER == "anthropic":
+        # Anthropic은 직접 HTTP 헬스체크 불가 — API key 유무만 확인
+        from monitoring_llm.llm_factory import ANTHROPIC_API_KEY
+        return [("anthropic", "https://api.anthropic.com" if ANTHROPIC_API_KEY else "http://localhost:0/")]
+    return [("ollama", OLLAMA_BASE_URL + "/api/tags")]
+
+
 # ── 엔드포인트 4: 헬스체크 ──────────────────────────────────────────
 @router.get("/health")
 async def health_check():
@@ -166,7 +176,7 @@ async def health_check():
         ("prometheus", os.getenv("PROMETHEUS_URL",  "http://localhost:9090") + "/-/healthy"),
         ("loki",       os.getenv("LOKI_URL",        "http://localhost:3100")  + "/ready"),
         _trace_entry,
-        ("ollama",     os.getenv("OLLAMA_BASE_URL", "http://localhost:11434") + "/api/tags"),
+        *(_llm_health_entry()),
     ]
     checks: dict[str, str] = {}
     # for name, url in endpoints:
@@ -199,6 +209,7 @@ async def health_check():
     return {
         "status":          status,
         "checks":          checks,
+        "llm_provider":    provider_info(),
         "active_sessions": get_store().active_count,
         "timestamp":       datetime.now().isoformat(),
     }

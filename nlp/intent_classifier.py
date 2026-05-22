@@ -35,8 +35,10 @@ from enum import Enum
 from typing import Optional
 
 log = logging.getLogger("monitoring_llm.nlp")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
+import sys, os as _os
+sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "../.."))
+from monitoring_llm.llm_factory import build_chat_llm, no_think_prefix
 
 # [개선 4] confidence 임계값 — 룰 결과가 이 값 미만이면 LLM 재확인
 CONFIDENCE_THRESHOLD = 0.85
@@ -384,33 +386,22 @@ A: {"intent":"error_analysis","confidence":0.96,"reason":"과거+OOM+원인질�
 # 출력: {{"intent":"<값>","confidence":0.0~1.0,"reason":"<한줄>"}}"""
 
 
-SYSTEM_PROMPT = f"""/no_think
-IT 운영 모니터링 쿼리 분류기. JSON만 출력. 마크다운 없이.
+_CLASSIFIER_PROMPT_BODY = f"""IT 운영 모니터링 쿼리 분류기. JSON만 출력. 마크다운 없이.
 
 인텐트: incident_history | asset_info | metric_range | multi_modal | error_analysis | action_recommend | unknown
 
 예시:{FEW_SHOT}
 출력형식(JSON만): {{"intent":"<값>","confidence":0.0~1.0,"reason":"<한줄>"}}"""
 
+def _classifier_system_prompt() -> str:
+    return no_think_prefix() + _CLASSIFIER_PROMPT_BODY
+
 
 # ── [개선 3] LLM 인스턴스를 함수 내부가 아닌 클래스에서 관리 ──────
-def _build_llm(model: str, base_url: str):
-    """ChatOllama 인스턴스 생성. 실패 시 None 반환."""
-    try:
-        from langchain_ollama import ChatOllama
-
-        return ChatOllama(
-            model=model,
-            base_url=base_url,
-            temperature=0.0,
-            num_predict=512,  # ← 150 → 512 (think 블록 포함 여유있게)
-            num_ctx=2048,  # ← 추가 (컨텍스트 제한으로 빠른 응답)
-            extra_body={"think": False},  # ← Ollama Qwen3 thinking 비활성화
-            # format="json" 제거 — Qwen3 /no_think 와 충돌해 빈 응답 유발
-        )
-    except Exception as e:
-        log.warning(f"[ChatOllama 초기화 실패] {e}")
-        return None
+def _build_llm(model: str = "", base_url: str = ""):
+    """llm_factory 경유 LLM 인스턴스 생성. 실패 시 None 반환."""
+    # model/base_url 인자는 하위 호환 유지를 위해 받되 무시 (factory가 env 읽음)
+    return build_chat_llm(temperature=0.0, max_tokens=512, num_ctx=2048)
 
 
 # def llm_classify(text: str, context: str = "") -> ClassifyResult:
@@ -423,9 +414,9 @@ def llm_classify(text: str, context: str = "", llm=None) -> ClassifyResult:
         #                  temperature=0.0, num_predict=120, format="json")
 
         # [개선 3] 외부 주입 llm 없으면 임시 생성 (하위 호환)
-        _llm = llm or _build_llm(OLLAMA_MODEL, OLLAMA_BASE_URL)
+        _llm = llm or _build_llm()
         if _llm is None:
-            raise RuntimeError("ChatOllama 인스턴스 없음")
+            raise RuntimeError("LLM 인스턴스 없음")
 
         msg = f"[이전 대화]\n{context}\n\n[질문]\n{text}" if context else text
 
@@ -433,7 +424,7 @@ def llm_classify(text: str, context: str = "", llm=None) -> ClassifyResult:
         #                    HumanMessage(content=msg)])
         resp = _llm.invoke(
             [
-                SystemMessage(content=SYSTEM_PROMPT),
+                SystemMessage(content=_classifier_system_prompt()),
                 HumanMessage(content=msg),
             ]
         )
@@ -491,15 +482,15 @@ def llm_classify(text: str, context: str = "", llm=None) -> ClassifyResult:
 class IntentClassifier:
     def __init__(
         self,
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_BASE_URL,
+        model="",        # 하위 호환 — factory가 env에서 읽으므로 무시됨
+        base_url="",     # 하위 호환 — factory가 env에서 읽으므로 무시됨
         use_llm=True,
         confidence_threshold=CONFIDENCE_THRESHOLD,
     ):
         self.use_llm = use_llm
         self.threshold = confidence_threshold
         # [개선 3] LLM 인스턴스를 생성자에서 한 번만 생성해 재사용
-        self._llm = _build_llm(model, base_url) if use_llm else None
+        self._llm = _build_llm() if use_llm else None
 
     def classify(self, text: str, context: str = "") -> ClassifyResult:
         result = rule_classify(text)

@@ -18,24 +18,20 @@ import logging
 from typing import Optional
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_ollama import ChatOllama
+
+from monitoring_llm.llm_factory import build_chat_llm, no_think_prefix, provider_info
 
 log = logging.getLogger("monitoring_llm.agent")
 
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "qwen3:8b")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-CMDB_DB_PATH    = os.getenv("CMDB_DB_PATH",    "cmdb.db")
+CMDB_DB_PATH = os.getenv("CMDB_DB_PATH", "cmdb.db")
 
 
 # ── LLM 인스턴스 ────────────────────────────────────────────────────
-def _llm(temperature: float = 0.2, num_predict: int = 2048) -> ChatOllama:
-    return ChatOllama(
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        temperature=temperature,
-        num_predict=num_predict,
-        num_ctx=8192,
-    )
+def _llm(temperature: float = 0.2, max_tokens: int = 2048):
+    llm = build_chat_llm(temperature=temperature, max_tokens=max_tokens)
+    if llm is None:
+        raise RuntimeError(f"LLM 초기화 실패 — provider: {provider_info()}")
+    return llm
 
 
 # ── Phase 3 파이프라인 싱글톤 ────────────────────────────────────────
@@ -538,8 +534,7 @@ def node_call_action(state: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════
 # 노드 8: LLM 응답 생성
 # ══════════════════════════════════════════════════════════════════
-SYSTEM_PROMPT = """/no_think
-당신은 BankSystem_16 (Apache→Tomcat→MySQL 3-tier) 운영팀 AIOps 전문가입니다.
+_SYSTEM_PROMPT_BODY = """당신은 BankSystem_16 (Apache→Tomcat→MySQL 3-tier) 운영팀 AIOps 전문가입니다.
 
 응답 원칙:
 1. 수집된 데이터(메트릭/로그/트레이스)를 반드시 근거로 인용하세요.
@@ -548,7 +543,9 @@ SYSTEM_PROMPT = """/no_think
 4. 운영자 승인이 필요한 조치는 ⚠️ 표시하세요.
 5. 근거 없는 추측은 하지 마세요.
 6. 한국어로 답변하세요."""
-# 7. Jaeger/Alertmanager 미설정은 즉시 조치가 아닙니다. 낮은 우선순위로만 언급하세요.
+
+def _system_prompt() -> str:
+    return no_think_prefix() + _SYSTEM_PROMPT_BODY
 
 
 def node_respond(state: dict) -> dict:
@@ -567,7 +564,7 @@ def node_respond(state: dict) -> dict:
     )
 
     llm_messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
+        SystemMessage(content=_system_prompt()),
         *messages[:-1],
         HumanMessage(content=analysis_prompt),
     ]
