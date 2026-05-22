@@ -33,6 +33,13 @@ import os
 import re
 from enum import Enum
 from typing import Optional
+import sys
+
+# nlp/bert/ → nlp/ → monitoring_llm/ → llm_test/  (3단계 위 = 패키지 루트)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.normpath(os.path.join(_HERE, "../../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 log = logging.getLogger("monitoring_llm.nlp")
 
@@ -43,6 +50,12 @@ from monitoring_llm.llm_factory import build_chat_llm, no_think_prefix
 # [개선 4] confidence 임계값 — 룰 결과가 이 값 미만이면 LLM 재확인
 CONFIDENCE_THRESHOLD = 0.85
 
+# BERT confidence 임계값 — 이 값 미만이면 Rule 로 fallback
+BERT_CONFIDENCE_THRESHOLD = float(os.getenv("BERT_CONFIDENCE_THRESHOLD", "0.85"))
+
+# BERT 출력 레이블 → QueryIntent 매핑 (Fine-tuning 시 사용한 레이블 이름에 맞게 수정)
+BERT_LABEL_MAP: dict[str, "QueryIntent"] = {}  # QueryIntent 정의 후 아래에서 채움
+
 
 class QueryIntent(str, Enum):
     INCIDENT_HISTORY = "incident_history"
@@ -52,6 +65,18 @@ class QueryIntent(str, Enum):
     ERROR_ANALYSIS = "error_analysis"
     ACTION_RECOMMEND = "action_recommend"
     UNKNOWN = "unknown"
+
+
+# QueryIntent 정의 이후에 매핑 초기화
+BERT_LABEL_MAP = {
+    "incident_history": QueryIntent.INCIDENT_HISTORY,
+    "asset_info":       QueryIntent.ASSET_INFO,
+    "metric_range":     QueryIntent.METRIC_RANGE,
+    "multi_modal":      QueryIntent.MULTI_MODAL,
+    "error_analysis":   QueryIntent.ERROR_ANALYSIS,
+    "action_recommend": QueryIntent.ACTION_RECOMMEND,
+    "unknown":          QueryIntent.UNKNOWN,
+}
 
 
 class ClassifyResult:
@@ -324,6 +349,77 @@ RULES = [
 ]
 
 
+# ── BERT Fine-tuning 분류기 ──────────────────────────────────────────
+_bert_pipeline = None  # 지연 로딩 (최초 bert_classify 호출 시 초기화)
+
+
+def _load_bert_pipeline():
+    """BERT_MODEL_PATH 환경변수가 설정된 경우에만 transformers pipeline 로드."""
+    global _bert_pipeline
+    if _bert_pipeline is not None:
+        return _bert_pipeline
+    model_path = os.getenv("BERT_MODEL_PATH", "")
+    if not model_path:
+        return None
+    try:
+        from transformers import pipeline as hf_pipeline
+        _bert_pipeline = hf_pipeline(
+            "text-classification",
+            model=model_path,
+            top_k=1,
+            device=-1,  # CPU. GPU 사용 시 device=0
+        )
+        log.info("[BERT] 모델 로드 완료: %s", model_path)
+    except Exception as e:
+        log.warning("[BERT] 모델 로드 실패: %s", e)
+        _bert_pipeline = None
+    return _bert_pipeline
+
+
+def bert_classify(text: str) -> Optional[ClassifyResult]:
+    """
+    Fine-tuned BERT 인텐트 분류기.
+
+    반환:
+      - ClassifyResult : BERT가 확신하는 결과 (confidence >= BERT_CONFIDENCE_THRESHOLD)
+      - None           : BERT 미설정이거나 UNKNOWN / 낮은 신뢰도 → Rule 로 자동 fallback
+
+    사용자 구현 가이드:
+      1. transformers Trainer 로 6-class 분류 모델 Fine-tuning 후 저장
+         (저장 레이블이 BERT_LABEL_MAP 키와 일치해야 함)
+      2. .env 에 BERT_MODEL_PATH=./models/intent-bert 설정
+      3. BERT_LABEL_MAP 을 모델 출력 레이블에 맞게 수정
+      4. 모델이 LABEL_0 형식을 출력하는 경우 아래 label 파싱 부분을 수정
+
+    Fine-tuning 예시 (별도 스크립트):
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+        # id2label = {0:"incident_history", 1:"asset_info", ...}
+        # ...
+    """
+    pipe = _load_bert_pipeline()
+    if pipe is None:
+        return None  # BERT 미설정 → Rule 로 fallback
+
+    try:
+        output = pipe(text[:512])[0]  # [{"label": "error_analysis", "score": 0.93}]
+        label      = str(output["label"]).lower()
+        confidence = float(output["score"])
+
+        intent = BERT_LABEL_MAP.get(label, QueryIntent.UNKNOWN)
+
+        if intent == QueryIntent.UNKNOWN or confidence < BERT_CONFIDENCE_THRESHOLD:
+            log.debug("[BERT] UNKNOWN/낮은conf(%.2f) → fallback: %s", confidence, text[:40])
+            return None
+
+        log.debug("[BERT] %s (%.2f): %s", intent.value, confidence, text[:40])
+        return ClassifyResult(intent, confidence, f"BERT:{label}", "bert")
+
+    except Exception as e:
+        log.warning("[BERT] 추론 실패: %s", e)
+        return None
+
+
+# ── Rule-based 분류기 ────────────────────────────────────────────────
 def rule_classify(text: str) -> Optional[ClassifyResult]:
     tl = text.lower()
     for cond, intent, conf, reason in RULES:
@@ -480,36 +576,53 @@ def llm_classify(text: str, context: str = "", llm=None) -> ClassifyResult:
 
 
 class IntentClassifier:
+    """
+    인텐트 분류기 — 3단계 체인:
+      1. BERT Fine-tuning  (BERT_MODEL_PATH 설정 시 활성화)
+      2. Rule-based        (항상 활성화)
+      3. LLM classify      (use_llm=True 시 활성화)
+
+    우선순위 변경: use_bert / use_llm 플래그로 각 단계 ON/OFF 가능.
+    """
+
     def __init__(
         self,
         model="",        # 하위 호환 — factory가 env에서 읽으므로 무시됨
         base_url="",     # 하위 호환 — factory가 env에서 읽으므로 무시됨
         use_llm=True,
+        use_bert=True,
         confidence_threshold=CONFIDENCE_THRESHOLD,
+        bert_threshold=BERT_CONFIDENCE_THRESHOLD,
     ):
         self.use_llm = use_llm
+        self.use_bert = use_bert
         self.threshold = confidence_threshold
-        # [개선 3] LLM 인스턴스를 생성자에서 한 번만 생성해 재사용
+        self.bert_threshold = bert_threshold
         self._llm = _build_llm() if use_llm else None
 
     def classify(self, text: str, context: str = "") -> ClassifyResult:
-        result = rule_classify(text)
+        # ── 1단계: BERT Fine-tuning ──────────────────────────────
+        if self.use_bert:
+            bert_result = bert_classify(text)
+            if bert_result:
+                return bert_result
+            # bert_result=None 이면 (미설정·UNKNOWN·낮은conf) 다음 단계로
 
-        # [개선 4] 룰 매칭됐더라도 confidence 가 임계값 미만이면 LLM 재확인
-        if result:
-            if result.confidence >= self.threshold or not self.use_llm:
-                return result
-            log.debug(f"[룰 conf 낮음 {result.confidence:.2f}] LLM 재확인: {text[:40]}")
-            llm_result = llm_classify(text, context, llm=self._llm)
-            # LLM 결과가 더 확실할 때만 교체
-            if llm_result.confidence > result.confidence:
-                return llm_result
-            return result
+        # ── 2단계: Rule-based ────────────────────────────────────
+        rule_result = rule_classify(text)
+        if rule_result:
+            if rule_result.confidence >= self.threshold or not self.use_llm:
+                return rule_result
+            log.debug("[룰 conf 낮음 %.2f] LLM 재확인: %s", rule_result.confidence, text[:40])
 
+        # ── 3단계: LLM classify ──────────────────────────────────
         if self.use_llm:
-            return llm_classify(text, context, llm=self._llm)
+            llm_result = llm_classify(text, context, llm=self._llm)
+            if rule_result and rule_result.confidence > llm_result.confidence:
+                return rule_result
+            return llm_result
 
-        return ClassifyResult(QueryIntent.UNKNOWN, 0.0, "룰 미매칭", "fallback")
+        return rule_result or ClassifyResult(QueryIntent.UNKNOWN, 0.0, "모든 분류기 미매칭", "fallback")
 
 
 # ── 테스트 케이스 ──────────────────────────────────────────────────
