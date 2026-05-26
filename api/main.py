@@ -110,6 +110,25 @@ def create_app() -> FastAPI:
             cmdb = CMDB(cmdb_path)
             seed_banksystem_16(cmdb)
 
+        # RAG 초기화 + 스케줄러 시작 (PGVECTOR_URL 설정 시)
+        from monitoring_llm.rag import init_rag, get_rag_store
+        await init_rag()
+        rag_store = get_rag_store()
+        if rag_store:
+            from monitoring_llm.rag.scheduler import RAGIndexScheduler
+            app.state.rag_scheduler = RAGIndexScheduler(rag_store)
+            await app.state.rag_scheduler.start()
+            log.info("  RAG 스케줄러    = 시작됨")
+        else:
+            log.info("  RAG             = 비활성화 (PGVECTOR_URL 미설정)")
+
+    @app.on_event("shutdown")
+    async def shutdown():
+        if hasattr(app.state, "rag_scheduler"):
+            await app.state.rag_scheduler.stop()
+        from monitoring_llm.rag import close_rag
+        await close_rag()
+
     return app
 
 

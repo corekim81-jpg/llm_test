@@ -554,14 +554,20 @@ def node_respond(state: dict) -> dict:
     tool_results = state.get("tool_results", {})
     messages     = state.get("messages", [])
     intent       = state.get("last_intent", "unknown")
+    servers      = [s.get("hostname", "") for s in state.get("current_servers", [])]
+    query        = messages[-1].content if messages else ""
 
     tool_json = json.dumps(tool_results, ensure_ascii=False, indent=2)
     if len(tool_json) > 4000:
         tool_json = tool_json[:4000] + "\n... (일부 생략)"
 
+    # ── RAG 컨텍스트 추가 ──────────────────────────────────────────
+    rag_context = _fetch_rag_context(query, intent, servers)
+
     analysis_prompt = (
         f"[수집된 모니터링 데이터]\n{tool_json}\n\n"
-        f"인텐트: {intent}\n\n"
+        + (f"{rag_context}\n\n" if rag_context else "")
+        + f"인텐트: {intent}\n\n"
         "위 데이터를 근거로 사용자 질문에 답변하세요."
     )
 
@@ -578,7 +584,46 @@ def node_respond(state: dict) -> dict:
     except Exception as e:
         text = f"⚠️ LLM 응답 생성 실패: {e}\n\n수집 데이터를 직접 확인하세요."
 
+    # ── error_analysis 결과 RCA 인덱싱 ────────────────────────────
+    if intent == "error_analysis":
+        _index_rca_async(query, text, intent, servers)
+
     return {
         "messages":       [AIMessage(content=text)],
         "final_response": text,
     }
+
+
+def _fetch_rag_context(query: str, intent: str, servers: list[str]) -> str:
+    """RAG 컨텍스트 동기 래퍼 (node_respond는 동기 함수)."""
+    try:
+        from monitoring_llm.rag import get_rag_store
+        store = get_rag_store()
+        if store is None:
+            return ""
+        import asyncio
+        from monitoring_llm.rag.retriever import RAGRetriever
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            RAGRetriever(store).retrieve(query, intent, servers)
+        )
+    except Exception as e:
+        log.debug("[RAG] 컨텍스트 조회 실패: %s", e)
+        return ""
+
+
+def _index_rca_async(query: str, response: str, intent: str, servers: list[str]):
+    """RCA 결과 비동기 인덱싱 (실패해도 무시)."""
+    try:
+        from monitoring_llm.rag import get_rag_store
+        store = get_rag_store()
+        if store is None:
+            return
+        import asyncio
+        from monitoring_llm.rag.rca_rag import RcaRAG
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            RcaRAG(store).index_rca_result(query, response, intent, servers)
+        )
+    except Exception as e:
+        log.debug("[RAG] RCA 인덱싱 실패: %s", e)

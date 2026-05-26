@@ -1,0 +1,27 @@
+# ================================================================
+# monitoring_llm RAG (pgvector) 의존성
+# ================================================================
+# 설치:
+#   pip install -r requirements-rag.txt
+#
+# 사전 요구사항:
+#   1. PostgreSQL 설치 + pgvector 확장 활성화
+#      CREATE EXTENSION IF NOT EXISTS vector;
+#
+#   2. RAG용 DB 생성
+#      CREATE DATABASE monitoring_rag;
+#
+#   3. Ollama 임베딩 모델 Pull
+#      ollama pull nomic-embed-text
+#
+#   4. .env 설정
+#      PGVECTOR_URL=postgresql://postgres:password@localhost:5432/monitoring_rag
+#      EMBED_MODEL=nomic-embed-text
+#      EMBED_DIM=768
+# ================================================================
+
+# ── pgvector / PostgreSQL 비동기 드라이버 ─────────────────────
+asyncpg>=0.29.0
+
+# ── 주기적 RAG 인덱싱 스케줄러 ──────────────────────────────────
+apscheduler>=3.10.0
