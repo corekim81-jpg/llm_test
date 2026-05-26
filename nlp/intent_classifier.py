@@ -366,8 +366,8 @@ def _load_bert_pipeline():
         _bert_pipeline = hf_pipeline(
             "text-classification",
             model=model_path,
-            top_k=1,
             device=-1,  # CPU. GPU 사용 시 device=0
+            # top_k 미설정 → 단일 결과를 dict로 반환 (top_k=1이면 list of list)
         )
         log.info("[BERT] 모델 로드 완료: %s", model_path)
     except Exception as e:
@@ -401,7 +401,10 @@ def bert_classify(text: str) -> Optional[ClassifyResult]:
         return None  # BERT 미설정 → Rule 로 fallback
 
     try:
-        output = pipe(text[:512])[0]  # [{"label": "error_analysis", "score": 0.93}]
+        raw = pipe(text[:512])
+        # top_k 없음 → [{"label":..., "score":...}]
+        # top_k=1    → [[{"label":..., "score":...}]]  (중첩 리스트)
+        output = raw[0][0] if isinstance(raw[0], list) else raw[0]
         label      = str(output["label"]).lower()
         confidence = float(output["score"])
 
@@ -612,6 +615,7 @@ class IntentClassifier:
         rule_result = rule_classify(text)
         if rule_result:
             if rule_result.confidence >= self.threshold or not self.use_llm:
+            # if rule_result.confidence >= 0.99 or not self.use_llm:
                 return rule_result
             log.debug("[룰 conf 낮음 %.2f] LLM 재확인: %s", rule_result.confidence, text[:40])
 
