@@ -71,6 +71,20 @@ class SessionStore:
         entry["turn_count"]  = entry.get("turn_count", 0) + 1
         return True
 
+    def restore(self, session_id: str, state: dict) -> None:
+        """이력 DB에서 복원한 상태로 세션을 생성/덮어쓰기."""
+        from langchain_core.messages import HumanMessage
+        now        = datetime.now()
+        messages   = state.get("messages", [])
+        turn_count = sum(1 for m in messages if isinstance(m, HumanMessage))
+        self._store[session_id] = {
+            "state":       state,
+            "created":     now,
+            "last_active": now,
+            "turn_count":  turn_count,
+        }
+        log.info(f"[Session] 이력 복원: {session_id} ({turn_count}턴)")
+
     def delete(self, session_id: str) -> bool:
         if session_id in self._store:
             del self._store[session_id]

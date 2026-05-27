@@ -20,8 +20,9 @@ from __future__ import annotations
 import os
 import asyncio
 import logging
+from datetime import datetime, timedelta, date as _date
 from typing import Optional, AsyncGenerator
-import httpx  # ✅ requests → httpx 교체
+import httpx
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -83,6 +84,18 @@ async def chat_stream(req: ChatRequest, request: Request):
         # ✅ stream_agent가 채운 out_state로 세션 갱신 (LLM 2회 호출 제거)
         if out_state:
             store.update(sid, out_state)
+            # 대화 이력 저장
+            from monitoring_llm.api.chat_history import get_history_store
+            hist = get_history_store()
+            if hist:
+                servers = [s.get("hostname", "") for s in out_state.get("current_servers", [])]
+                asyncio.create_task(hist.save_turn(
+                    sid,
+                    req.message,
+                    out_state.get("final_response", ""),
+                    out_state.get("last_intent", ""),
+                    servers,
+                ))
         else:
             log.warning(f"[Session] out_state 비어있음, 세션 갱신 생략: {sid}")
 
@@ -114,6 +127,16 @@ async def chat_sync(req: ChatRequest):
     response_text, updated = await asyncio.to_thread(run_query, req.message, state)
     store.update(sid, updated)
 
+    # 대화 이력 저장
+    from monitoring_llm.api.chat_history import get_history_store
+    hist = get_history_store()
+    if hist:
+        servers = [s.get("hostname", "") for s in updated.get("current_servers", [])]
+        asyncio.create_task(hist.save_turn(
+            sid, req.message, response_text,
+            updated.get("last_intent", ""), servers,
+        ))
+
     return ChatResponse(
         session_id = sid,
         response   = response_text,
@@ -133,6 +156,41 @@ async def get_session(session_id: str):
     return meta
 
 
+@router.post("/session/restore/{session_id}")
+async def restore_session(session_id: str):
+    """이력 DB에서 세션 상태 복원 — 이전 대화 이어받기."""
+    from langchain_core.messages import HumanMessage, AIMessage
+    from monitoring_llm.agent.state import make_initial_state
+    from monitoring_llm.agent.nodes import LLM_HISTORY_TURNS
+    from monitoring_llm.api.chat_history import get_history_store
+
+    hist = get_history_store()
+    if hist is None:
+        return {"restored": False, "reason": "history disabled"}
+
+    messages = await hist.get_messages(session_id)
+    if not messages:
+        return {"restored": False, "reason": "no history"}
+
+    # 최근 LLM_HISTORY_TURNS 턴만 복원 (컨텍스트 윈도우 절약)
+    recent = messages[-(LLM_HISTORY_TURNS * 2):]
+
+    lc_messages = []
+    for msg in recent:
+        if msg["role"] == "user":
+            lc_messages.append(HumanMessage(content=msg["content"]))
+        else:
+            lc_messages.append(AIMessage(content=msg["content"]))
+
+    state = make_initial_state()
+    state["messages"] = lc_messages
+
+    store = get_store()
+    store.restore(session_id, state)
+
+    return {"restored": True, "messages_loaded": len(lc_messages)}
+
+
 @router.delete("/session/{session_id}")
 async def delete_session(session_id: str):
     store = get_store()
@@ -145,6 +203,64 @@ async def delete_session(session_id: str):
 async def list_sessions():
     store = get_store()
     return {"active_count": store.active_count, "sessions": store.all_meta()}
+
+
+# ── 엔드포인트 5: 대화 이력 ─────────────────────────────────────────
+@router.get("/history")
+async def list_history(days: int = 30, per_day: int = 20):
+    """날짜별로 그룹핑된 대화 세션 목록."""
+    from monitoring_llm.api.chat_history import get_history_store
+    hist = get_history_store()
+    if hist is None:
+        return {"sessions": [], "enabled": False}
+    sessions = await hist.list_sessions(days=days, per_day=per_day)
+    return {"sessions": _group_by_date(sessions), "enabled": True}
+
+
+@router.get("/history/{session_id}")
+async def get_history_messages(session_id: str):
+    """특정 세션의 메시지 목록."""
+    from monitoring_llm.api.chat_history import get_history_store
+    hist = get_history_store()
+    if hist is None:
+        raise HTTPException(503, "대화 이력 비활성화 상태 (PGVECTOR_URL 미설정)")
+    messages = await hist.get_messages(session_id)
+    if not messages:
+        raise HTTPException(404, f"세션 '{session_id}' 이력 없음")
+    return {"session_id": session_id, "messages": messages}
+
+
+def _group_by_date(sessions: list[dict]) -> list[dict]:
+    today     = _date.today()
+    yesterday = today - timedelta(days=1)
+    groups: dict[str, list] = {}
+
+    for s in sessions:
+        raw = s.get("last_active", "")
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        except Exception:
+            dt = today
+
+        if dt == today:
+            label = "오늘"
+        elif dt == yesterday:
+            label = "어제"
+        elif dt >= today - timedelta(days=7):
+            label = "이번 주"
+        else:
+            label = dt.strftime("%Y년 %m월")
+
+        groups.setdefault(label, []).append(s)
+
+    order  = ["오늘", "어제", "이번 주"]
+    result = []
+    for label in order:
+        if label in groups:
+            result.append({"label": label, "items": groups.pop(label)})
+    for label, items in groups.items():
+        result.append({"label": label, "items": items})
+    return result
 
 
 def _llm_health_entry() -> list[tuple]:

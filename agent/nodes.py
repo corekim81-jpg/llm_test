@@ -23,7 +23,9 @@ from monitoring_llm.llm_factory import build_chat_llm, no_think_prefix, provider
 
 log = logging.getLogger("monitoring_llm.agent")
 
-CMDB_DB_PATH = os.getenv("CMDB_DB_PATH", "cmdb.db")
+CMDB_DB_PATH      = os.getenv("CMDB_DB_PATH", "cmdb.db")
+NLP_HISTORY_TURNS = int(os.getenv("NLP_HISTORY_TURNS", "4"))   # NLP 파싱용 이전 턴 수
+LLM_HISTORY_TURNS = int(os.getenv("LLM_HISTORY_TURNS", "10"))  # LLM 응답용 이전 턴 수
 
 
 # ── LLM 인스턴스 ────────────────────────────────────────────────────
@@ -172,7 +174,7 @@ def node_nlp_parse(state: dict) -> dict:
     if not user_text:
         return {"error": "사용자 메시지 없음"}
 
-    history = messages[:-1][-6:]
+    history = messages[:-1][-(NLP_HISTORY_TURNS * 2):]  # 턴당 메시지 2개 (Human+AI)
     context = "\n".join(
         f"{'사용자' if isinstance(m, HumanMessage) else 'AI'}: {m.content[:200]}"
         for m in history
@@ -573,7 +575,7 @@ def node_respond(state: dict) -> dict:
 
     llm_messages = [
         SystemMessage(content=_system_prompt()),
-        *messages[:-1],
+        *messages[:-1][-(LLM_HISTORY_TURNS * 2):],  # 턴당 메시지 2개 (Human+AI)
         HumanMessage(content=analysis_prompt),
     ]
 

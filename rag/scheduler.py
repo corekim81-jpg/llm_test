@@ -114,3 +114,11 @@ class RAGIndexScheduler:
             log.info("[RAGScheduler] 오래된 벡터 정리 완료")
         except Exception as e:
             log.warning("[RAGScheduler] 정리 실패: %s", e)
+
+        try:
+            from monitoring_llm.api.chat_history import get_history_store
+            hist = get_history_store()
+            if hist:
+                await hist.cleanup_old()
+        except Exception as e:
+            log.warning("[RAGScheduler] 대화 이력 정리 실패: %s", e)

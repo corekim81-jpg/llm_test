@@ -81,7 +81,10 @@ def create_app() -> FastAPI:
 
     @app.get("/ui", tags=["ui"])
     async def ui():
-        return FileResponse(_STATIC_DIR / "index.html")
+        return FileResponse(
+            _STATIC_DIR / "index.html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 
     @app.get("/", tags=["root"])
     async def root():
@@ -122,12 +125,22 @@ def create_app() -> FastAPI:
         else:
             log.info("  RAG             = 비활성화 (PGVECTOR_URL 미설정)")
 
+        # 대화 이력 초기화
+        from monitoring_llm.api.chat_history import init_history, get_history_store
+        await init_history()
+        if get_history_store():
+            log.info("  ChatHistory     = 활성화 (PostgreSQL)")
+        else:
+            log.info("  ChatHistory     = 비활성화 (PGVECTOR_URL 미설정)")
+
     @app.on_event("shutdown")
     async def shutdown():
         if hasattr(app.state, "rag_scheduler"):
             await app.state.rag_scheduler.stop()
         from monitoring_llm.rag import close_rag
         await close_rag()
+        from monitoring_llm.api.chat_history import close_history
+        await close_history()
 
     return app
 
