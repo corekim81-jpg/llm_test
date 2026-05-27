@@ -596,34 +596,42 @@ def node_respond(state: dict) -> dict:
 
 def _fetch_rag_context(query: str, intent: str, servers: list[str]) -> str:
     """RAG 컨텍스트 동기 래퍼 (node_respond는 동기 함수)."""
+    import asyncio
+    import concurrent.futures
+
     try:
         from monitoring_llm.rag import get_rag_store
         store = get_rag_store()
         if store is None:
             return ""
-        import asyncio
         from monitoring_llm.rag.retriever import RAGRetriever
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            RAGRetriever(store).retrieve(query, intent, servers)
-        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                asyncio.run,
+                RAGRetriever(store).retrieve(query, intent, servers),
+            )
+            return future.result(timeout=10)
     except Exception as e:
         log.debug("[RAG] 컨텍스트 조회 실패: %s", e)
+        return ""
         return ""
 
 
 def _index_rca_async(query: str, response: str, intent: str, servers: list[str]):
     """RCA 결과 비동기 인덱싱 (실패해도 무시)."""
-    try:
-        from monitoring_llm.rag import get_rag_store
-        store = get_rag_store()
-        if store is None:
-            return
-        import asyncio
-        from monitoring_llm.rag.rca_rag import RcaRAG
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(
-            RcaRAG(store).index_rca_result(query, response, intent, servers)
-        )
-    except Exception as e:
-        log.debug("[RAG] RCA 인덱싱 실패: %s", e)
+    import asyncio
+    import threading
+
+    def _run():
+        try:
+            from monitoring_llm.rag import get_rag_store
+            store = get_rag_store()
+            if store is None:
+                return
+            from monitoring_llm.rag.rca_rag import RcaRAG
+            asyncio.run(RcaRAG(store).index_rca_result(query, response, intent, servers))
+        except Exception as e:
+            log.debug("[RAG] RCA 인덱싱 실패: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()

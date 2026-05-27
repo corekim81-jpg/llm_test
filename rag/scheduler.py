@@ -78,6 +78,10 @@ class RAGIndexScheduler:
             n = await LogRAG(self.store).index_recent(minutes=LOG_INTERVAL_MIN + 1)
             if n:
                 log.info("[RAGScheduler] 로그 %d건 인덱싱", n)
+            else:
+                log.info("[RAGScheduler] 로그 %d건 인덱싱2", n)
+
+                
         except Exception as e:
             log.warning("[RAGScheduler] 로그 인덱싱 실패: %s", e)
 
@@ -89,6 +93,9 @@ class RAGIndexScheduler:
             )
             if n:
                 log.info("[RAGScheduler] 트레이스 %d건 인덱싱", n)
+            else:
+                log.info("[RAGScheduler] 트레이스 %d건 인덱싱2", n)
+                
         except Exception as e:
             log.warning("[RAGScheduler] 트레이스 인덱싱 실패: %s", e)
 
