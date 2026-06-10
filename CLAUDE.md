@@ -116,3 +116,14 @@ The session resolves server references ("was01") to full metadata by querying th
 - **web01/02** (Linux) — OTel exporters, Promtail → Loki
 - **was01/02** (Windows) — Grafana Alloy, JMX exporter → Prometheus
 - **db01/02** (Windows) — Grafana Alloy, MySQL exporter → Prometheus
+
+## 하네스: AIOps 모니터링 서비스
+
+**목표:** NLP·Tools·Agent·API·RAG 5개 레이어에 걸친 기능 개발·버그 수정·디버깅 자동화
+
+**트리거:** 새 인텐트/도구 추가, 버그 수정, 파이프라인 디버깅, 레이어 간 변경 조율 요청 시 `aiops-orchestrator` 스킬을 사용하라. 단순 코드 설명이나 단일 파일 질문은 직접 응답 가능.
+
+**변경 이력:**
+| 날짜 | 변경 내용 | 대상 | 사유 |
+|------|----------|------|------|
+| 2026-06-10 | 초기 구성 | 전체 | 신규 하네스 구축 |
